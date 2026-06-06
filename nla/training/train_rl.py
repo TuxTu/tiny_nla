@@ -178,10 +178,30 @@ def train(args) -> None:
     actor_optimizer = torch.optim.AdamW(actor.parameters(), lr=args.lr_actor)
     critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=args.lr_critic)
 
-    # ---- training loop -------------------------------------------------------
+    # ---- SGLang rollout server (start once, hot-reload each step) ----------
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     actor_save = Path(args.output_dir) / "actor"
     critic_save = Path(args.output_dir) / "critic"
+
+    rollout = None
+    if getattr(args, "use_sglang", False):
+        from nla.training.sglang_rollout import (
+            SGLangRollout,
+            prepare_batch_embeddings,
+        )
+
+        # Initial save so SGLang has weights to load
+        actor.save_pretrained(str(actor_save))
+        tokenizer.save_pretrained(str(actor_save))
+
+        rollout = SGLangRollout(
+            str(actor_save),
+            mem_fraction=getattr(args, "sglang_mem_fraction", 0.70),
+        )
+        rollout.start()
+        print("SGLang server started (will hot-reload weights each step).")
+
+    # ---- training loop -------------------------------------------------------
     global_step = 0
     actor_losses = []
     critic_losses = []
@@ -224,48 +244,34 @@ def train(args) -> None:
             all_responses = []
             all_tokens = []
 
-            if getattr(args, "use_sglang", False):
-                # ---- SGLang rollout -------------------------------------------
-                from nla.training.sglang_rollout import (
-                    SGLangRollout,
-                    prepare_batch_embeddings,
+            if rollout is not None:
+                # ---- SGLang rollout (server already running) -----------------
+                # Build embeddings for all prompts × N samples
+                embed_layer = actor.get_input_embeddings()
+                embeds_list = []
+                for i, (msgs, vec) in enumerate(zip(messages_batch, vectors)):
+                    for _ in range(N):
+                        emb = prepare_batch_embeddings(
+                            tokenizer, [msgs], vec.unsqueeze(0),
+                            embed_layer,
+                            injection_char=injection_char,
+                            inj_token_id=inj_id,
+                            left_neighbor_id=left_id,
+                            right_neighbor_id=right_id,
+                            # Vectors already normalized above — don't
+                            # double-normalize inside prepare_batch_embeddings.
+                            injection_scale=None,
+                            max_length=args.max_length,
+                            device=env.device,
+                        )
+                        embeds_list.append(emb[0])  # unwrap list
+
+                # Concurrent generation — SGLang continuous-batches
+                sglang_responses = rollout.generate(
+                    embeds_list,
+                    max_new_tokens=args.max_response_len,
+                    temperature=1.0,
                 )
-
-                # Save actor so SGLang picks up latest weights
-                actor.save_pretrained(str(actor_save))
-                tokenizer.save_pretrained(str(actor_save))
-
-                rollout = SGLangRollout(
-                    str(actor_save),
-                    mem_fraction=getattr(args, "sglang_mem_fraction", 0.70),
-                )
-                with rollout:
-                    # Build embeddings for all prompts × N samples
-                    embed_layer = actor.get_input_embeddings()
-                    embeds_list = []
-                    for i, (msgs, vec) in enumerate(zip(messages_batch, vectors)):
-                        for _ in range(N):
-                            emb = prepare_batch_embeddings(
-                                tokenizer, [msgs], vec.unsqueeze(0),
-                                embed_layer,
-                                injection_char=injection_char,
-                                inj_token_id=inj_id,
-                                left_neighbor_id=left_id,
-                                right_neighbor_id=right_id,
-                                # Vectors already normalized above — don't
-                                # double-normalize inside prepare_batch_embeddings.
-                                injection_scale=None,
-                                max_length=args.max_length,
-                                device=env.device,
-                            )
-                            embeds_list.append(emb[0])  # unwrap list
-
-                    # Batch generate — SGLang continuous-batches internally
-                    sglang_responses = rollout.generate(
-                        embeds_list,
-                        max_new_tokens=args.max_response_len,
-                        temperature=1.0,
-                    )
 
                 # Re-tokenize prompt+response for policy gradient.
                 # sglang_responses order: [p1_r1, p1_r2, ..., p1_rN, p2_r1, ...]
@@ -466,6 +472,12 @@ def train(args) -> None:
             actor_optimizer.zero_grad()
             actor_losses.append(actor_loss_sum / (B * N))
 
+            # ---- sync updated weights to SGLang for next step ----------
+            if rollout is not None:
+                actor.save_pretrained(str(actor_save))
+                tokenizer.save_pretrained(str(actor_save))
+                rollout.update_weights(str(actor_save))
+
             # ================================================================
             # 5. CRITIC UPDATE (continued MSE)
             # ================================================================
@@ -519,6 +531,11 @@ def train(args) -> None:
         if not any_data:
             print("  DataLoader exhausted — stopping.")
             break
+
+    # ---- cleanup --------------------------------------------------------------
+    if rollout is not None:
+        rollout.stop()
+        print("SGLang server stopped.")
 
     # ---- final save ----------------------------------------------------------
     if actor_losses:

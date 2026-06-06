@@ -177,6 +177,38 @@ class SGLangRollout:
         self.stop()
         return False
 
+    # -- weight sync ----------------------------------------------------------
+
+    def update_weights(self, model_path: str | None = None) -> None:
+        """Hot-reload model weights from disk without restarting the server.
+
+        Calls SGLang's ``/update_weights_from_disk`` endpoint.  This avoids the
+        ~3-10s server restart overhead per training step — the server stays
+        alive and continuous-batching cache is preserved.
+
+        Parameters
+        ----------
+        model_path :
+            Path to updated checkpoint.  Defaults to the original model_path
+            the server was launched with.
+        """
+        import urllib.request
+
+        target = str(Path(model_path or self.model_path).resolve())
+        body = json.dumps({"model_path": target}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self._base_url}/update_weights_from_disk",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read())
+            if not result.get("success", False):
+                print(f"[SGLang] update_weights failed: {result}")
+        except Exception as e:
+            print(f"[SGLang] update_weights error: {e}")
+
     # -- generation -----------------------------------------------------------
 
     def generate(
