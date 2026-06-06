@@ -222,62 +222,127 @@ def train(args) -> None:
             all_responses = []
             all_tokens = []
 
-            actor.eval()  # generation mode
-            with torch.no_grad():
-                for i, prompt_text in enumerate(prompt_texts):
-                    # Tokenize prompt
-                    prompt_enc = tokenizer(
-                        prompt_text, return_tensors="pt",
+            if getattr(args, "use_sglang", False):
+                # ---- SGLang rollout -------------------------------------------
+                from nla.training.sglang_rollout import (
+                    SGLangRollout,
+                    prepare_batch_embeddings,
+                )
+
+                # Save actor so SGLang picks up latest weights
+                actor.save_pretrained(str(actor_save))
+                tokenizer.save_pretrained(str(actor_save))
+
+                rollout = SGLangRollout(
+                    str(actor_save),
+                    mem_fraction=getattr(args, "sglang_mem_fraction", 0.70),
+                )
+                with rollout:
+                    # Build embeddings for all prompts × N samples
+                    embed_layer = actor.get_input_embeddings()
+                    embeds_list = []
+                    for i, (msgs, vec) in enumerate(zip(messages_batch, vectors)):
+                        for _ in range(N):
+                            emb = prepare_batch_embeddings(
+                                tokenizer, [msgs], vec.unsqueeze(0),
+                                embed_layer,
+                                injection_char=injection_char,
+                                inj_token_id=inj_id,
+                                left_neighbor_id=left_id,
+                                right_neighbor_id=right_id,
+                                # Vectors already normalized above — don't
+                                # double-normalize inside prepare_batch_embeddings.
+                                injection_scale=None,
+                                max_length=args.max_length,
+                                device=env.device,
+                            )
+                            embeds_list.append(emb[0])  # unwrap list
+
+                    # Batch generate — SGLang continuous-batches internally
+                    sglang_responses = rollout.generate(
+                        embeds_list,
+                        max_new_tokens=args.max_response_len,
+                        temperature=1.0,
+                    )
+
+                # Re-tokenize prompt+response for policy gradient.
+                # sglang_responses order: [p1_r1, p1_r2, ..., p1_rN, p2_r1, ...]
+                expected_texts = [
+                    ptext for ptext in prompt_texts for _ in range(N)
+                ]
+                for i, (ptext, sglang_text) in enumerate(
+                    zip(expected_texts, sglang_responses)
+                ):
+                    all_responses.append(sglang_text)
+                    full_text = ptext + sglang_text
+                    full_ids = tokenizer(
+                        full_text, return_tensors="pt",
                         truncation=True, max_length=args.max_length,
-                    )
-                    prompt_ids = prompt_enc["input_ids"].to(env.device)
+                    )["input_ids"][0]
+                    all_tokens.append(full_ids)
 
-                    # Register injection hook for this prompt's generation
-                    vec = vectors[i:i+1]  # [1, d]
+                # Free embeddings from CPU memory
+                del embeds_list
+                actor.train()  # ensure training mode
 
-                    def _make_gen_hook(_vec, _inj_id, _left_id, _right_id):
-                        def _hook(module, args, output):
-                            # args[0] is the input_ids passed to embed_tokens.
-                            # During generate() with num_return_sequences>1, the batch
-                            # is duplicated, so use the actual input_ids, not captured.
-                            actual_ids = args[0]
-                            # Only inject during prefill (seq len matches prompt).
-                            # During decode, KV cache is used and only 1 new token embedded.
-                            if output.shape[1] > 1:
-                                return inject_at_marked_positions(
-                                    actual_ids, output, _vec.repeat(output.shape[0], 1),
-                                    _inj_id, _left_id, _right_id,
-                                )
-                            return output
-                        return _hook
-
-                    embed = actor.get_input_embeddings()
-                    hook = embed.register_forward_hook(
-                        _make_gen_hook(vec, inj_id, left_id, right_id)
-                    )
-
-                    try:
-                        gen_out = actor.generate(
-                            prompt_ids,
-                            max_new_tokens=args.max_response_len,
-                            do_sample=True,
-                            temperature=1.0,
-                            num_return_sequences=N,
-                            pad_token_id=tokenizer.pad_token_id,
-                            eos_token_id=tokenizer.eos_token_id,
+            else:
+                # ---- HF generate (default) -----------------------------------
+                actor.eval()  # generation mode
+                with torch.no_grad():
+                    for i, prompt_text in enumerate(prompt_texts):
+                        # Tokenize prompt
+                        prompt_enc = tokenizer(
+                            prompt_text, return_tensors="pt",
+                            truncation=True, max_length=args.max_length,
                         )
-                    finally:
-                        hook.remove()
+                        prompt_ids = prompt_enc["input_ids"].to(env.device)
 
-                    # Decode responses (strip prompt)
-                    for s in range(N):
-                        seq = gen_out[s]
-                        resp_ids = seq[prompt_ids.shape[1]:]  # strip prompt
-                        resp_text = tokenizer.decode(resp_ids, skip_special_tokens=True)
-                        all_responses.append(resp_text)
-                        all_tokens.append(seq)
+                        # Register injection hook for this prompt's generation
+                        vec = vectors[i:i+1]  # [1, d]
 
-            actor.train()  # back to training mode
+                        def _make_gen_hook(_vec, _inj_id, _left_id, _right_id):
+                            def _hook(module, args, output):
+                                # args[0] is the input_ids passed to embed_tokens.
+                                # During generate() with num_return_sequences>1, the batch
+                                # is duplicated, so use the actual input_ids, not captured.
+                                actual_ids = args[0]
+                                # Only inject during prefill (seq len matches prompt).
+                                # During decode, KV cache is used and only 1 new token embedded.
+                                if output.shape[1] > 1:
+                                    return inject_at_marked_positions(
+                                        actual_ids, output, _vec.repeat(output.shape[0], 1),
+                                        _inj_id, _left_id, _right_id,
+                                    )
+                                return output
+                            return _hook
+
+                        embed = actor.get_input_embeddings()
+                        hook = embed.register_forward_hook(
+                            _make_gen_hook(vec, inj_id, left_id, right_id)
+                        )
+
+                        try:
+                            gen_out = actor.generate(
+                                prompt_ids,
+                                max_new_tokens=args.max_response_len,
+                                do_sample=True,
+                                temperature=1.0,
+                                num_return_sequences=N,
+                                pad_token_id=tokenizer.pad_token_id,
+                                eos_token_id=tokenizer.eos_token_id,
+                            )
+                        finally:
+                            hook.remove()
+
+                        # Decode responses (strip prompt)
+                        for s in range(N):
+                            seq = gen_out[s]
+                            resp_ids = seq[prompt_ids.shape[1]:]  # strip prompt
+                            resp_text = tokenizer.decode(resp_ids, skip_special_tokens=True)
+                            all_responses.append(resp_text)
+                            all_tokens.append(seq)
+
+                actor.train()  # back to training mode
 
             # ================================================================
             # 2. REWARD via critic
@@ -453,6 +518,10 @@ def main() -> None:
                    help="save checkpoint every N steps (default: 100)")
     p.add_argument("--resume", action="store_true",
                    help="resume from checkpoint in --output-dir")
+    p.add_argument("--use-sglang", action="store_true",
+                   help="use SGLang for batched rollout generation")
+    p.add_argument("--sglang-mem-fraction", type=float, default=0.70,
+                   help="GPU memory fraction for SGLang (default: 0.70)")
     args = p.parse_args()
     train(args)
 

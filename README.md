@@ -38,8 +38,11 @@ configs/
 ## Quick Start
 
 ```bash
-pip install -e .
+pip install -e .            # core pipeline
+pip install -e ".[rl]"      # + SGLang for fast RL rollout (requires GPU)
+```
 
+```bash
 # 1. Generate labels + vectors
 python -m nla.datagen.run_pipeline --config configs/datagen_0.6b_25k.yaml
 
@@ -64,13 +67,21 @@ python -m nla.training.train_actor_sft \
   --model-name Qwen/Qwen3-0.6B \
   --output-dir data/checkpoints/actor_sft --num-steps 1000
 
-# 5. RL training (GRPO)
+# 5. RL training (GRPO) — default: HF generate()
 python -m nla.training.train_rl \
   --data data/qwen3_0.6b/rl_train.parquet \
   --model-name Qwen/Qwen3-0.6B \
   --actor-ckpt data/checkpoints/actor_sft \
   --critic-ckpt data/checkpoints/critic_sft \
   --output-dir data/checkpoints/rl --n-samples 8 --num-steps 200
+
+# 5b. RL with SGLang (faster — requires pip install -e ".[rl]")
+python -m nla.training.train_rl \
+  --data data/qwen3_0.6b/rl_train.parquet \
+  --actor-ckpt data/checkpoints/actor_sft \
+  --critic-ckpt data/checkpoints/critic_sft \
+  --output-dir data/checkpoints/rl --n-samples 8 --num-steps 200 \
+  --use-sglang --sglang-mem-fraction 0.7
 ```
 
 ## Pipeline stages

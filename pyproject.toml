@@ -17,7 +17,12 @@ dependencies = [
     "tqdm",
     "anthropic",
     "pyyaml",
+    "safetensors",
 ]
+
+[project.optional-dependencies]
+sglang = ["sglang[all]>=0.3.0"]
+rl = ["sglang[all]>=0.3.0"]
 
 [tool.setuptools.packages.find]
 include = ["nla*"]
