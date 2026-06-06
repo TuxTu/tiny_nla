@@ -87,6 +87,12 @@ class NLACriticModel(PreTrainedModel):
             with torch.no_grad():
                 model.value_head.weight.copy_(torch.eye(config.hidden_size))
 
+        # Ensure value_head is on the same device as the backbone.
+        # When using device_map, backbone params are auto-placed but value_head
+        # (a custom nn.Linear) stays on CPU. Move it to match the first backbone param.
+        backbone_device = next(model.backbone.parameters()).device
+        model.value_head = model.value_head.to(backbone_device)
+
         return model
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs):

@@ -73,6 +73,12 @@ def main() -> None:
                    help="max tokens per document (default: 2048)")
     p.add_argument("--device", default=None,
                    help="device override: cuda, mps, cpu (default: auto-detect)")
+    p.add_argument("--gpus", type=int, default=None,
+                   help="number of GPUs for data-parallel extraction (default: 1)")
+    p.add_argument("--shard-id", type=int, default=None,
+                   help="shard index for manual splitting (0-indexed)")
+    p.add_argument("--num-shards", type=int, default=None,
+                   help="total shards for manual splitting")
     add_config_arg(p)
     args = apply_config(p)
 
@@ -140,7 +146,74 @@ def main() -> None:
     doc_items = sorted(docs.items(), key=lambda x: x[0])  # deterministic order
     print(f"positions: {table.num_rows} rows across {len(docs)} unique docs")
 
-    # ---- forward hook ------------------------------------------------------
+    # ---- sharding -----------------------------------------------------------
+    num_gpus = getattr(args, "gpus", None) or 1
+    if num_gpus > 1 and not getattr(args, "shard_id", None):
+        # Multi-GPU: spawn one process per GPU, each handles a slice of docs.
+        available = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if available == 0:
+            raise RuntimeError("--gpus requires CUDA devices")
+        if num_gpus > available:
+            print(f"warning: --gpus {num_gpus} > available GPUs ({available}), "
+                  f"using {available}")
+            args.gpus = available
+        _run_multi_gpu(args, doc_items, d_model, layer_index)
+        return
+
+    shard_id = getattr(args, "shard_id", None) or 0
+    num_shards = getattr(args, "num_shards", None) or 1
+    shard_slice = slice(
+        shard_id * len(doc_items) // num_shards,
+        (shard_id + 1) * len(doc_items) // num_shards if shard_id < num_shards - 1 else len(doc_items),
+    )
+    if num_shards > 1:
+        shard_output = f"{args.output}.shard_{shard_id:03d}"
+    else:
+        shard_output = args.output
+
+    # ---- run extraction on this shard ---------------------------------------
+    norms, n_written, n_skipped = _extract_shard(
+        doc_items[shard_slice],
+        model=model,
+        tokenizer=tokenizer,
+        layers=layers,
+        layer_index=layer_index,
+        d_model=d_model,
+        batch_size=args.batch_size,
+        max_length=args.max_length,
+        output_path=shard_output,
+        shard_label=f"gpu {shard_id}" if num_shards > 1 else "extracting",
+    )
+
+    # Multi-GPU handled by _run_multi_gpu which prints stats after merge.
+    if num_gpus > 1 and not getattr(args, "shard_id", None):
+        return
+
+    print(f"wrote {n_written} rows → {shard_output}")
+    if n_skipped:
+        print(f"  skipped {n_skipped} positions (token count mismatch after re-tokenization)")
+    _print_norm_stats(norms)
+
+
+# ---------------------------------------------------------------------------
+# extraction logic (shared by single-GPU and multi-GPU)
+# ---------------------------------------------------------------------------
+
+
+def _extract_shard(
+    doc_items: list,
+    *,
+    model,
+    tokenizer,
+    layers,
+    layer_index: int,
+    d_model: int,
+    batch_size: int,
+    max_length: int,
+    output_path: str,
+    shard_label: str = "extracting",
+) -> tuple[list[float], int, int]:
+    """Run extraction on a slice of docs, write to output_path."""
     captured: torch.Tensor | None = None
 
     def _hook(_module, _inputs, output):
@@ -150,7 +223,6 @@ def main() -> None:
 
     handle = layers[layer_index].register_forward_hook(_hook)
 
-    # ---- output schema -----------------------------------------------------
     schema = pa.schema([
         ("doc_id", pa.string()),
         ("n_raw_tokens", pa.int64()),
@@ -158,28 +230,24 @@ def main() -> None:
         ("activation_layer", pa.int64()),
     ])
 
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     n_written = 0
     n_skipped = 0
     norms: list[float] = []
+    device = model.get_input_embeddings().weight.device
 
-    with pq.ParquetWriter(args.output, schema) as writer:
-        pbar = tqdm(total=len(docs), desc="extracting vectors")
+    with pq.ParquetWriter(output_path, schema) as writer:
+        pbar = tqdm(total=len(doc_items), desc=shard_label)
         i = 0
-        while i < len(docs):
-            batch_items = doc_items[i:i + args.batch_size]
+        while i < len(doc_items):
+            batch_items = doc_items[i:i + batch_size]
             texts = [item[1]["longest_text"] for item in batch_items]
 
             enc = tokenizer(
-                texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=args.max_length,
+                texts, return_tensors="pt", padding=True,
+                truncation=True, max_length=max_length,
                 add_special_tokens=True,
             )
-            device = model.get_input_embeddings().weight.device
             input_ids = enc["input_ids"].to(device)
             attention_mask = enc["attention_mask"].to(device)
 
@@ -189,22 +257,19 @@ def main() -> None:
                 f"hook on layer {layer_index} did not fire — wrong architecture?"
             )
 
-            hidden = captured.float().cpu()  # [batch, max_seq, d_model]
-            lengths = attention_mask.sum(dim=1).cpu()  # actual seq lengths
+            hidden = captured.float().cpu()
+            lengths = attention_mask.sum(dim=1).cpu()
 
             rows: dict[str, list] = {k: [] for k in schema.names}
             for j, (did, info) in enumerate(batch_items):
-                seq_len = int(lengths[j].item())
-                doc_hidden = hidden[j, :seq_len]  # unpacked [seq, d_model]
-
+                doc_hidden = hidden[j, :int(lengths[j].item())]
                 for nrt in info["positions"]:
-                    pos = nrt - 1  # n_raw_tokens is 1-indexed
+                    pos = nrt - 1  # 1-indexed → 0-indexed
                     if pos >= doc_hidden.shape[0]:
                         n_skipped += 1
                         continue
                     vec = doc_hidden[pos].clone()
-                    nrm = float(torch.linalg.norm(vec).item())
-                    norms.append(nrm)
+                    norms.append(float(torch.linalg.norm(vec).item()))
                     rows["doc_id"].append(did)
                     rows["n_raw_tokens"].append(nrt)
                     rows["activation_vector"].append(vec.tolist())
@@ -215,8 +280,6 @@ def main() -> None:
             i += len(batch_items)
             pbar.update(len(batch_items))
 
-            # Free MPS/CUDA cache between batches to prevent accumulation.
-            # MPS in particular does not auto-release cached allocations.
             if device.type == "mps":
                 torch.mps.empty_cache()
             elif device.type == "cuda":
@@ -224,19 +287,114 @@ def main() -> None:
 
     handle.remove()
     pbar.close()
+    return norms, n_written, n_skipped
 
-    print(f"wrote {n_written} rows → {args.output}")
-    if n_skipped:
-        print(f"  skipped {n_skipped} positions (token count mismatch after re-tokenization)")
 
-    # ---- injection scale recommendation ------------------------------------
-    if norms:
-        mean = sum(norms) / len(norms)
-        std = (sum((n - mean) ** 2 for n in norms) / len(norms)) ** 0.5
-        print(f"\nvector L2-norm stats:")
-        print(f"  mean: {mean:.2f}  std: {std:.2f}  min: {min(norms):.2f}  max: {max(norms):.2f}")
-        scale = round(mean, -1) if mean >= 10 else round(mean, 1)
-        print(f"  recommended injection_scale: {scale:.1f}  (round value near mean norm)")
+def _run_multi_gpu(args, doc_items: list, d_model: int, layer_index: int) -> None:
+    """Spawn one process per GPU, merge shard outputs."""
+    import torch.multiprocessing as mp
+
+    num_gpus = args.gpus
+
+    def _worker(gpu_id: int) -> None:
+        """Run extraction on a single GPU slice."""
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+        # Build args namespace for this worker
+        from argparse import Namespace
+        w_args = Namespace(
+            input=args.input, model_name=args.model_name,
+            layer_index=args.layer_index, output=args.output,
+            batch_size=args.batch_size, max_length=args.max_length,
+            device=f"cuda:0",  # CUDA_VISIBLE_DEVICES remaps to physical GPU
+            gpus=None, shard_id=gpu_id, num_shards=num_gpus,
+            config=None,
+        )
+        _run_shard(w_args, doc_items, d_model, layer_index)
+
+    print(f"launching {num_gpus} GPU workers ...")
+    mp.spawn(_worker, nprocs=num_gpus, join=True)
+
+    # Merge shard parquets
+    print("merging shard outputs ...")
+    tables = []
+    for gid in range(num_gpus):
+        shard_path = f"{args.output}.shard_{gid:03d}"
+        t = pq.read_table(shard_path)
+        tables.append(t)
+        Path(shard_path).unlink()
+    merged = pa.concat_tables(tables)
+    pq.write_table(merged, args.output)
+    print(f"merged {merged.num_rows} rows → {args.output}")
+
+    # Print norm stats
+    col = merged.column("activation_vector")
+    norms = [float(torch.linalg.norm(torch.tensor(v.as_py())).item()) for v in col]
+    _print_norm_stats(norms)
+
+
+def _run_shard(args, doc_items: list, d_model: int, layer_index: int) -> None:
+    """Load model on this GPU and extract vectors for our shard."""
+    # Detect device
+    if args.device:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    use_device_map = device.type == "cuda"
+
+    # Load model
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "right"
+    tokenizer.truncation_side = "right"
+
+    model_kwargs = dict(dtype=torch.bfloat16)
+    if use_device_map:
+        model_kwargs["device_map"] = "auto"
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name, **model_kwargs,
+    ).eval()
+    if not use_device_map:
+        model = model.to(device)
+
+    layers = _resolve_decoder_layers(model)
+
+    shard_id = args.shard_id or 0
+    num_shards = args.num_shards or 1
+    shard_slice = slice(
+        shard_id * len(doc_items) // num_shards,
+        (shard_id + 1) * len(doc_items) // num_shards
+        if shard_id < num_shards - 1 else len(doc_items),
+    )
+    shard_output = f"{args.output}.shard_{shard_id:03d}"
+
+    norms, n_written, n_skipped = _extract_shard(
+        doc_items[shard_slice],
+        model=model, tokenizer=tokenizer, layers=layers,
+        layer_index=layer_index, d_model=d_model,
+        batch_size=args.batch_size, max_length=args.max_length,
+        output_path=shard_output,
+        shard_label=f"gpu {shard_id}/{num_shards}",
+    )
+    print(f"[gpu {shard_id}] wrote {n_written} rows (skipped {n_skipped})")
+
+
+def _print_norm_stats(norms: list[float]) -> None:
+    """Print L2-norm statistics for extracted vectors."""
+    if not norms:
+        return
+    mean = sum(norms) / len(norms)
+    variance = sum((n - mean) ** 2 for n in norms) / len(norms)
+    std = variance ** 0.5
+    print(f"\nvector L2-norm stats:")
+    print(f"  mean: {mean:.2f}  std: {std:.2f}  min: {min(norms):.2f}  max: {max(norms):.2f}")
+    scale = round(mean, -1) if mean >= 10 else round(mean, 1)
+    print(f"  recommended injection_scale: {scale:.1f}  (round value near mean norm)")
 
 
 if __name__ == "__main__":
