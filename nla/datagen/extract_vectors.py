@@ -16,6 +16,7 @@ Output schema (matches original stage3_build input):
 """
 
 import argparse
+import os
 from pathlib import Path
 
 import pyarrow as pa

@@ -393,38 +393,71 @@ def train(args) -> None:
             # ================================================================
             # 4. ACTOR UPDATE (policy gradient + optional KL)
             # ================================================================
+            #
+            # CRITICAL: the prompt contains the injection character. Without the
+            # injection hook the model sees the literal token embedding instead of
+            # the activation vector — log-probs and KL would be computed under the
+            # wrong conditioning, breaking the policy gradient signal.
+            # ================================================================
+            actor_embed = actor.get_input_embeddings()
+            ref_embed = ref_model.get_input_embeddings() if ref_model is not None else None
+
             actor_loss_sum = 0.0
             for s in range(B * N):
-                seq = all_tokens[s].unsqueeze(0)  # [1, T]
+                seq = all_tokens[s].to(env.device).unsqueeze(0)  # [1, T]
                 attn = torch.ones_like(seq)
+                parent_idx = s // N
+                vec = vectors[parent_idx:parent_idx + 1]  # [1, d_model]
 
-                with torch.autocast(device_type=env.device.type, dtype=env.dtype,
-                                    enabled=env.amp_enabled):
-                    out = actor(input_ids=seq, attention_mask=attn)
-                    logits = out.logits  # [1, T, V]
+                # --- actor forward with injection hook ---
+                def _make_actor_hook(_ids, _vec, _inj, _left, _right):
+                    def _hook(_module, _args, output):
+                        return inject_at_marked_positions(
+                            _ids, output, _vec, _inj, _left, _right,
+                        )
+                    return _hook
 
-                    # Log-probs of the generated sequence
-                    log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
-                    target_ids = seq[:, 1:]
-                    token_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
-                    seq_log_prob = token_log_probs.sum()
+                actor_hook = actor_embed.register_forward_hook(
+                    _make_actor_hook(seq, vec, inj_id, left_id, right_id)
+                )
+                try:
+                    with torch.autocast(device_type=env.device.type, dtype=env.dtype,
+                                        enabled=env.amp_enabled):
+                        out = actor(input_ids=seq, attention_mask=attn,
+                                   use_cache=False)
+                        logits = out.logits  # [1, T, V]
 
-                    # Reference log-probs for KL
-                    kl_penalty = torch.tensor(0.0, device=env.device)
-                    if ref_model is not None:
-                        with torch.no_grad():
-                            ref_out = ref_model(input_ids=seq, attention_mask=attn)
-                            ref_logits = ref_out.logits
-                            ref_log_probs = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
-                            ref_token_log_probs = ref_log_probs.gather(
-                                -1, target_ids.unsqueeze(-1)
-                            ).squeeze(-1)
-                            ref_seq_log_prob = ref_token_log_probs.sum()
-                            kl_penalty = seq_log_prob - ref_seq_log_prob
+                        # Log-probs of the generated sequence
+                        log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
+                        target_ids = seq[:, 1:]
+                        token_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+                        seq_log_prob = token_log_probs.sum()
 
-                    # Policy gradient: -advantage * log_prob
-                    pg_loss = -(advantages[s] * seq_log_prob)
-                    loss = pg_loss + args.kl_coef * kl_penalty
+                        # Reference log-probs for KL
+                        kl_penalty = torch.tensor(0.0, device=env.device)
+                        if ref_model is not None and ref_embed is not None:
+                            with torch.no_grad():
+                                ref_hook = ref_embed.register_forward_hook(
+                                    _make_actor_hook(seq, vec, inj_id, left_id, right_id)
+                                )
+                                try:
+                                    ref_out = ref_model(input_ids=seq, attention_mask=attn,
+                                                       use_cache=False)
+                                finally:
+                                    ref_hook.remove()
+                                ref_logits = ref_out.logits
+                                ref_log_probs = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
+                                ref_token_log_probs = ref_log_probs.gather(
+                                    -1, target_ids.unsqueeze(-1)
+                                ).squeeze(-1)
+                                ref_seq_log_prob = ref_token_log_probs.sum()
+                                kl_penalty = seq_log_prob - ref_seq_log_prob
+
+                        # Policy gradient: -advantage * log_prob
+                        pg_loss = -(advantages[s] * seq_log_prob)
+                        loss = pg_loss + args.kl_coef * kl_penalty
+                finally:
+                    actor_hook.remove()
 
                 loss.backward()
                 actor_loss_sum += loss.detach().item()
