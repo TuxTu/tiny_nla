@@ -1,0 +1,30 @@
+# Training data (large parquet files)
+data/
+*.parquet
+*.parquet.chunks/
+
+# Checkpoints
+checkpoint*/
+*_checkpoint/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Note: .nla_meta.yaml sidecars and injection_token_cache.yaml are
+# small metadata files — they ARE tracked in git.

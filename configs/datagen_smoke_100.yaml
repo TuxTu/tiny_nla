@@ -1,0 +1,29 @@
+# Quick test — 100 docs, 10 positions/doc = ~1000 positions.
+
+tokenizer_name: Qwen/Qwen3-0.6B
+
+corpus:
+  name: HuggingFaceFW/fineweb
+  config: sample-10BT
+  split: train
+
+positions_per_doc: 10
+min_position: 50
+max_length: 2048
+seed: 42
+
+pool_dir: data/pool
+output_dir: data/test
+
+num_docs: 100
+
+split:
+  av_sft: 0.25
+  ar_sft: 0.25
+  rl: 0.50
+
+model_name: Qwen/Qwen3-0.6B
+batch_size: 1                # M4 MPS — keep low to avoid OOM; bump to 8+ on A100
+
+provider:
+  name: deepseek

@@ -1,0 +1,40 @@
+# Training config — Qwen3-0.6B, critic SL → actor SFT → RL (GRPO).
+# Run each stage separately (no unified orchestrator yet).
+
+# --- shared ---
+model_name: Qwen/Qwen3-0.6B
+tokenizer_name: Qwen/Qwen3-0.6B
+
+# --- critic SL (AR: text → vector) ---
+critic:
+  data: data/output/ar_sft_train.parquet
+  output_dir: data/checkpoints/critic_sft
+  micro_batch_size: 8
+  lr: 2.0e-5
+  num_steps: 1000
+  mse_scale: sqrt_d_model
+
+# --- actor SFT (AV: vector → text) ---
+actor:
+  data: data/output/av_sft_train.parquet
+  output_dir: data/checkpoints/actor_sft
+  micro_batch_size: 4
+  lr: 2.0e-5
+  num_steps: 1000
+  max_length: 2048
+  injection_scale: raw         # no normalization for raw vectors
+
+# --- RL (GRPO) ---
+rl:
+  data: data/output/rl_train.parquet
+  actor_ckpt: data/checkpoints/actor_sft
+  critic_ckpt: data/checkpoints/critic_sft
+  output_dir: data/checkpoints/rl
+  n_samples: 8                 # responses per prompt for GRPO
+  rollout_batch: 16            # prompts per generation round
+  micro_batch_size: 2
+  lr_actor: 1.0e-5
+  lr_critic: 1.0e-5
+  kl_coef: 0.01               # KL penalty coefficient (0 = no reference model)
+  max_response_len: 300
+  num_steps: 200

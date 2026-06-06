@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nla"
+version = "0.1.0"
+description = "Lightweight NLA (Natural Language Autoencoders) pipeline for small HuggingFace models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pyarrow",
+    "datasets",
+    "httpx",
+    "transformers",
+    "torch",
+    "tqdm",
+    "anthropic",
+    "pyyaml",
+]
+
+[tool.setuptools.packages.find]
+include = ["nla*"]

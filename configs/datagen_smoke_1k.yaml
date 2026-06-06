@@ -1,0 +1,28 @@
+# Test run — 1k docs, 10 positions/doc = ~10k positions, ~¥2 at V4 Flash pricing.
+
+tokenizer_name: Qwen/Qwen3-0.6B
+
+corpus:
+  name: HuggingFaceFW/fineweb
+  config: sample-10BT
+  split: train
+
+positions_per_doc: 10
+min_position: 50
+seed: 42
+
+pool_dir: data/pool
+output_dir: data/test_1k
+
+num_docs: 1000
+
+split:
+  av_sft: 0.25
+  ar_sft: 0.25
+  rl: 0.50
+
+model_name: Qwen/Qwen3-0.6B
+# layer_index: 18                   # optional, auto-detected if omitted
+
+provider:
+  name: deepseek

@@ -1,0 +1,35 @@
+# Pipeline config — Qwen3 tokenizer, 25k FineWeb docs.
+# Runs extract → explain → output for a 0.6B model.
+#
+# Usage:
+#   python -m nla.datagen.run_pipeline --config configs/pipeline_qwen3_0.6b.yaml
+#
+# The pool (data/pool/) grows incrementally.  Re-run with a larger num_docs
+# and only new docs will be extracted + labeled; existing labels are reused.
+
+tokenizer_name: Qwen/Qwen3-0.6B          # any Qwen3 model — same tokenizer family
+
+corpus:
+  name: HuggingFaceFW/fineweb
+  config: sample-10BT
+  split: train
+
+positions_per_doc: 10
+min_position: 50
+seed: 42
+
+pool_dir: data/pool                     # shared pool — grows across model runs
+output_dir: data/qwen3_0.6b             # model-specific output
+
+num_docs: 25000                         # total docs for this model
+
+split:                                   # model-specific split ratio
+  av_sft: 0.25
+  ar_sft: 0.25
+  rl: 0.50
+
+provider:
+  name: deepseek
+  # model: deepseek-v4-flash            # default
+  # max_tokens: 400                     # default
+  # concurrency: 32                     # default
