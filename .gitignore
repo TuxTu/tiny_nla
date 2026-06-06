@@ -6,6 +6,11 @@ data/
 # Checkpoints
 checkpoint*/
 *_checkpoint/
+checkpoints/
+
+# Claude Code / agents
+.claude/
+.agents/
 
 # Python
 __pycache__/

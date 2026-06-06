@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 from transformers import AutoTokenizer
 
 from nla.training.injection_tokens import build_token_meta
+from nla.training.resolve import resolve_parquet
 from nla.training.schema import (
     ACTIVATION_COLUMN,
     INJECT_PLACEHOLDER,
@@ -65,8 +66,8 @@ def build(
 ) -> None:
     """Join explained + vectors, format prompts, write training parquet + sidecar."""
     # ---- load and join -------------------------------------------------------
-    expl = pq.read_table(explained_path)
-    vecs = pq.read_table(vectors_path)
+    expl = pq.read_table(resolve_parquet(explained_path))
+    vecs = pq.read_table(resolve_parquet(vectors_path))
 
     # Verify join keys match
     expl_keys = set(

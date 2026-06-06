@@ -45,8 +45,10 @@ class RLDataset(Dataset):
     """RL parquet → (messages, activation_vector) pairs. No response column."""
 
     def __init__(self, parquet_path: str, injection_char: str):
-        raw_prompts = pq.read_table(parquet_path).column("prompt").to_pylist()
-        col = pq.read_table(parquet_path).column(ACTIVATION_COLUMN)
+        from nla.training.resolve import resolve_parquet
+        table = pq.read_table(resolve_parquet(parquet_path))
+        raw_prompts = table.column("prompt").to_pylist()
+        col = table.column(ACTIVATION_COLUMN)
         self.vectors = np.array([v.as_py() for v in col], dtype=np.float32)
 
         self.prompts = []
@@ -75,8 +77,12 @@ def train(args) -> None:
     env = detect()
     print(f"device: {env.device}  dtype: {env.dtype}")
 
+    # ---- resolve data path (may be HF Hub repo) --------------------------------
+    from nla.training.resolve import resolve_parquet
+    data_path = resolve_parquet(args.data)
+
     # ---- sidecar -------------------------------------------------------------
-    sidecar = read_sidecar(args.data)
+    sidecar = read_sidecar(data_path)
     tokens = sidecar.get("tokens", {})
     injection_char = tokens["injection_char"]
     inj_id = tokens["injection_token_id"]
@@ -106,14 +112,23 @@ def train(args) -> None:
     tokenizer.truncation_side = "right"
 
     # ---- data ----------------------------------------------------------------
-    ds = RLDataset(args.data, injection_char)
+    ds = RLDataset(data_path, injection_char)
     print(f"dataset: {len(ds)} rows  d_model={d_model}")
 
     # ---- actor model ---------------------------------------------------------
-    print(f"loading actor from {args.actor_ckpt} ...")
     from transformers import AutoModelForCausalLM
+    actor_ckpt = args.actor_ckpt
+    if args.resume:
+        resume_actor = Path(args.output_dir) / "actor"
+        if resume_actor.joinpath("config.json").exists():
+            actor_ckpt = str(resume_actor.resolve())
+            print(f"resuming actor from {actor_ckpt} ...")
+        else:
+            print(f"no RL actor checkpoint at {resume_actor} — starting from scratch")
+    else:
+        print(f"loading actor from {actor_ckpt} ...")
     actor = AutoModelForCausalLM.from_pretrained(
-        args.actor_ckpt, torch_dtype=env.dtype,
+        actor_ckpt, torch_dtype=env.dtype,
         device_map={"": env.device} if not env.is_mps else None,
     )
     if env.is_mps:
@@ -124,6 +139,7 @@ def train(args) -> None:
     print(f"actor: {actor.config.num_hidden_layers} layers")
 
     # ---- reference model (frozen, for KL) ------------------------------------
+    # Always use the original SFT checkpoint — not the RL checkpoint.
     ref_model = None
     if args.kl_coef > 0:
         print(f"loading reference model from {args.actor_ckpt} ...")
@@ -138,10 +154,18 @@ def train(args) -> None:
             p.requires_grad_(False)
 
     # ---- critic model --------------------------------------------------------
-    print(f"loading critic from {args.critic_ckpt} ...")
-    # Critic checkpoint already has truncated config — don't pass nla_num_layers
+    critic_ckpt = args.critic_ckpt
+    if args.resume:
+        resume_critic = Path(args.output_dir) / "critic"
+        if resume_critic.joinpath("value_head.safetensors").exists():
+            critic_ckpt = str(resume_critic.resolve())
+            print(f"resuming critic from {critic_ckpt} ...")
+        else:
+            print(f"no RL critic checkpoint at {resume_critic} — starting from scratch")
+    else:
+        print(f"loading critic from {critic_ckpt} ...")
     critic = NLACriticModel.from_pretrained(
-        args.critic_ckpt,
+        critic_ckpt,
         torch_dtype=env.dtype,
         device_map={"": env.device} if not env.is_mps else None,
     )
@@ -162,6 +186,12 @@ def train(args) -> None:
     actor_losses = []
     critic_losses = []
     reward_history = []
+
+    def _save():
+        actor.save_pretrained(str(actor_save))
+        critic.save_pretrained(str(critic_save))
+        tokenizer.save_pretrained(str(actor_save))
+        print(f"  checkpoint saved → {args.output_dir}  (step {global_step})")
 
     def _collate(batch):
         prompts, vectors = zip(*batch)
@@ -380,16 +410,18 @@ def train(args) -> None:
                 critic_loss=f"{critic_losses[-1]:.4f}",
                 reward=f"{mean_r:.4f}",
             )
+
+            if global_step % args.save_every == 0 and global_step > 0:
+                _save()
+
             global_step += 1
 
-    # ---- save ----------------------------------------------------------------
-    print(f"\nactor_loss: {actor_losses[-1]:.4f}  "
-          f"critic_loss: {critic_losses[-1]:.4f}  "
-          f"reward: {reward_history[-1]:.4f}")
-    actor.save_pretrained(str(actor_save))
-    critic.save_pretrained(str(critic_save))
-    tokenizer.save_pretrained(str(actor_save))
-    print(f"saved → {args.output_dir}")
+    # ---- final save ----------------------------------------------------------
+    if actor_losses:
+        print(f"\nactor_loss: {actor_losses[-1]:.4f}  "
+              f"critic_loss: {critic_losses[-1]:.4f}  "
+              f"reward: {reward_history[-1]:.4f}")
+    _save()
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +449,10 @@ def main() -> None:
     p.add_argument("--max-response-len", type=int, default=300)
     p.add_argument("--max-length", type=int, default=2048)
     p.add_argument("--num-steps", type=int, default=2)
+    p.add_argument("--save-every", type=int, default=100,
+                   help="save checkpoint every N steps (default: 100)")
+    p.add_argument("--resume", action="store_true",
+                   help="resume from checkpoint in --output-dir")
     args = p.parse_args()
     train(args)
 

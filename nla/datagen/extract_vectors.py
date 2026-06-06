@@ -25,6 +25,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from nla.datagen._common import add_config_arg, apply_config
+from nla.training.resolve import resolve_parquet
 
 
 def _resolve_text_config(config):
@@ -116,7 +117,7 @@ def main() -> None:
     print(f"  d_model={d_model}  layers={num_layers}  layer_index={layer_index}")
 
     # ---- read positions ----------------------------------------------------
-    table = pq.read_table(args.input)
+    table = pq.read_table(resolve_parquet(args.input))
     assert "doc_id" in table.column_names, "input must have doc_id column"
     assert "n_raw_tokens" in table.column_names, "input must have n_raw_tokens column"
     assert "detokenized_text_truncated" in table.column_names, (
