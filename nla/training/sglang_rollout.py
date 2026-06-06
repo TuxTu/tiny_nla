@@ -35,6 +35,7 @@ import signal
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -185,12 +186,16 @@ class SGLangRollout:
         max_new_tokens: int = 300,
         temperature: float = 1.0,
         top_p: float = 1.0,
+        max_concurrent: int = 16,
     ) -> list[str]:
         """Generate text from pre-computed input embeddings.
 
         Each embedding in the list produces one response.  Embeddings MUST
         already have the activation vector injected at the marker position
         (use ``inject_at_marked_positions`` before calling).
+
+        Requests are sent concurrently (ThreadPoolExecutor) so SGLang's
+        continuous batching can interleave generation across the batch.
 
         Parameters
         ----------
@@ -200,6 +205,8 @@ class SGLangRollout:
             Maximum tokens to generate per sequence.
         temperature, top_p :
             Sampling parameters passed directly to SGLang.
+        max_concurrent :
+            Max concurrent HTTP requests to SGLang (default 16).
 
         Returns
         -------
@@ -214,9 +221,10 @@ class SGLangRollout:
             "stop_token_ids": [],  # SGLang will use EOS by default
         }
 
-        responses: list[str] = []
+        # Pre-serialize all embeddings on the main thread, then fire
+        # concurrent HTTP requests so SGLang continuous-batches them.
+        payloads: list[bytes] = []
         for i, embeds in enumerate(input_embeds_list):
-            # Assert correct shape
             assert embeds.ndim == 3, (
                 f"input_embeds[{i}] must be [1, seq_len, d_model], "
                 f"got shape {tuple(embeds.shape)}"
@@ -224,18 +232,21 @@ class SGLangRollout:
             assert embeds.shape[0] == 1, (
                 f"input_embeds[{i}] batch dim must be 1, got {embeds.shape[0]}"
             )
-
-            # Serialize: torch.save → bytes → base64
             buf = io.BytesIO()
             torch.save(embeds.cpu(), buf)
             payload_b64 = _encode_bytes(buf.getvalue())
-
             body = json.dumps({
                 "input_embeds": payload_b64,
                 "input_embeds_shape": list(embeds.shape),
                 "sampling_params": sampling_params,
             }).encode("utf-8")
+            payloads.append(body)
 
+        # Concurrent requests — SGLang receives them near-simultaneously
+        # and continuous-batches across the entire batch.
+        results: dict[int, str] = {}
+
+        def _send_one(index: int, body: bytes) -> tuple[int, str]:
             req = urllib.request.Request(
                 f"{self._base_url}/generate",
                 data=body,
@@ -244,14 +255,22 @@ class SGLangRollout:
             try:
                 with urllib.request.urlopen(req, timeout=_GENERATE_TIMEOUT) as resp:
                     result = json.loads(resp.read())
-                text = result.get("text", "")
-                responses.append(text)
+                return index, result.get("text", "")
             except Exception as e:
-                # Log failure and return empty string — caller handles
-                print(f"[SGLang] generate failed for prompt {i}: {e}")
-                responses.append("")
+                print(f"[SGLang] generate failed for prompt {index}: {e}")
+                return index, ""
 
-        return responses
+        with ThreadPoolExecutor(max_workers=min(max_concurrent, len(payloads))) as pool:
+            futures = [
+                pool.submit(_send_one, i, body)
+                for i, body in enumerate(payloads)
+            ]
+            for future in as_completed(futures):
+                idx, text = future.result()
+                results[idx] = text
+
+        # Preserve input order
+        return [results[i] for i in range(len(input_embeds_list))]
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ from typing import Any
 
 import yaml
 
+from nla import compute_tokenizer_fingerprint
 from nla.training.schema import NLATokenMeta, compute_canonical_neighbors
 
 _CacheEntry = dict[str, Any]
@@ -31,8 +32,13 @@ def _tokenize_one(tokenizer: Any, text: str) -> list[int]:
 
 
 def find_injection_token(tokenizer: Any) -> tuple[str, int]:
-    """Auto-pick a single-token CJK char for activation injection. Cached."""
-    key = tokenizer.name_or_path
+    """Auto-pick a single-token CJK char for activation injection. Cached.
+
+    Cache key is the tokenizer fingerprint (vocab hash) rather than
+    name_or_path, so models sharing an identical tokenizer (e.g. Qwen3-0.6B
+    and Qwen3-4B) reuse the same injection character.
+    """
+    key = compute_tokenizer_fingerprint(tokenizer)
     cache = _load_cache()
 
     if key in cache:

@@ -88,10 +88,9 @@ class DeepSeekProvider(CompletionProvider):
                     if not content:
                         return None
                     return content
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code >= 500 or e.response.status_code == 429:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
+                except httpx.HTTPStatusError:
+                    # 429 and 5xx are already handled before raise_for_status()
+                    # above. This catches only non-retryable 4xx errors.
                     raise
                 except (
                     httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError,

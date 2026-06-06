@@ -69,7 +69,8 @@ Text to analyze:
 _DEFAULT_RESPONSE_PATTERN = r"<analysis>\s*(.*?)\s*</analysis>"
 
 # Minimum features required — fewer than 2 means the model ignored format.
-_MIN_FEATURES = 1
+# The prompt template explicitly asks for 2-3 features.
+_MIN_FEATURES = 2
 
 # Prefix stripping — API models use all kinds of list markers.
 _LIST_PREFIX_RE = re.compile(
