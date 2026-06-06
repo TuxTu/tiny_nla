@@ -162,7 +162,9 @@ def train(args) -> None:
 
     while global_step < args.num_steps:
         pbar = tqdm(dl, desc=f"actor  step={global_step}/{args.num_steps}")
+        any_data = False
         for messages_batch, responses_batch, vectors_batch in pbar:
+            any_data = True
             if global_step >= args.num_steps:
                 break
 
@@ -241,6 +243,10 @@ def train(args) -> None:
             losses.append(loss.item())
             pbar.set_postfix(loss=f"{loss.item():.4f}")
             global_step += 1
+
+        if not any_data:
+            print("  DataLoader exhausted — stopping.")
+            break
 
     # ---- final save ----------------------------------------------------------
     avg_loss = sum(losses) / len(losses) if losses else 0

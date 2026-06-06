@@ -202,7 +202,9 @@ def train(args) -> None:
 
     while global_step < args.num_steps:
         pbar = tqdm(dl, desc=f"rl  step={global_step}/{args.num_steps}")
+        any_data = False
         for messages_batch, vectors_batch in pbar:
+            any_data = True
             if global_step >= args.num_steps:
                 break
 
@@ -480,6 +482,10 @@ def train(args) -> None:
                 _save()
 
             global_step += 1
+
+        if not any_data:
+            print("  DataLoader exhausted — stopping.")
+            break
 
     # ---- final save ----------------------------------------------------------
     if actor_losses:
