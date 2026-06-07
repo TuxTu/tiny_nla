@@ -13,13 +13,14 @@ Circuits paper](https://transformer-circuits.pub/2026/nla/index.html) for **smal
 open-source models** (Qwen3 0.6B & 4B) using only HuggingFace Transformers +
 PyTorch. The original implementation targets 7B–70B models on 16-GPU clusters
 and depends on Anthropic's proprietary Miles training framework. Ours runs on a
-**single Colab A100**.
+**single Colab A100** and scales to multi-GPU nodes via PyTorch DDP.
 
 **Key finding:** SFT training works — the actor produces format-correct,
-structurally valid explanations. GRPO reinforcement learning systematically
-fails at this scale because the truncated critic model (≤ 25 layers) lacks
-sufficient capacity to provide a discriminative reward signal. This is a
-**scaling-law boundary**, not an implementation error.
+structurally valid explanations. GRPO reinforcement learning does not improve
+upon SFT at this scale — likely because the truncated critic model (≤ 25 layers)
+may lack sufficient capacity to provide a discriminative reward signal, though
+other factors (KL formulation, SFT data volume, reward design) could also
+contribute.
 
 ---
 
@@ -314,10 +315,14 @@ with neighbor verification is robust — zero false-positive injections across
 all training and evaluation runs. The decoupled labeling approach works as
 designed: one set of labels, reused across model sizes.
 
-**What doesn't:** GRPO RL requires a critic capable of FVE > 0. At 0.6B–4B
-scale with 2/3 layer truncation, this is not achievable. The KL penalty
-formulation is a sharp edge — sequence-level squared difference causes gradient
-explosion that sequence-length scaling alone cannot fix.
+**What doesn't:** GRPO RL did not improve upon SFT at either scale. One likely
+factor is critic capacity: at 0.6B–4B with 2/3 layer truncation, the critic's
+FVE is negative, meaning the reward signal may be too noisy for GRPO to
+optimize. The KL penalty formulation is also a sharp edge — sequence-level
+squared difference causes gradient explosion that per-token KL resolves, but
+correcting this alone did not prevent collapse. Other unexplored factors
+include SFT data volume, reward shaping (e.g., format bonus), and the
+SGLang–HF distribution mismatch during rollout.
 
 **Open questions:** What is the minimum model scale for critic FVE > 0? Would
 full-depth critics (no layer truncation) close the gap? Can a format reward
