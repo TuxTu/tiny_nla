@@ -74,12 +74,10 @@ def main() -> None:
                    help="max tokens per document (default: 2048)")
     p.add_argument("--device", default=None,
                    help="device override: cuda, mps, cpu (default: auto-detect)")
-    p.add_argument("--gpus", type=int, default=None,
-                   help="number of GPUs for data-parallel extraction (default: 1)")
     p.add_argument("--shard-id", type=int, default=None,
-                   help="shard index for manual splitting (0-indexed)")
+                   help="shard index for data-parallel splitting (0-indexed)")
     p.add_argument("--num-shards", type=int, default=None,
-                   help="total shards for manual splitting")
+                   help="total shards for data-parallel splitting")
     add_config_arg(p)
     args = apply_config(p)
 
@@ -92,7 +90,6 @@ def main() -> None:
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
-    use_device_map = device.type == "cuda"
     print(f"device: {device.type}")
 
     # ---- load model and tokenizer ------------------------------------------
@@ -102,14 +99,9 @@ def main() -> None:
     tokenizer.padding_side = "right"
     tokenizer.truncation_side = "right"
 
-    model_kwargs = dict(dtype=torch.bfloat16)
-    if use_device_map:
-        model_kwargs["device_map"] = "auto"
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_name, **model_kwargs,
-    ).eval()
-    if not use_device_map:
-        model = model.to(device)
+        args.model_name, dtype=torch.bfloat16,
+    ).eval().to(device)
 
     d_model = _resolve_text_config(model.config).hidden_size
     layers = _resolve_decoder_layers(model)
@@ -147,34 +139,24 @@ def main() -> None:
     doc_items = sorted(docs.items(), key=lambda x: x[0])  # deterministic order
     print(f"positions: {table.num_rows} rows across {len(docs)} unique docs")
 
-    # ---- sharding -----------------------------------------------------------
-    num_gpus = getattr(args, "gpus", None) or 1
-    if num_gpus > 1 and not getattr(args, "shard_id", None):
-        # Multi-GPU: spawn one process per GPU, each handles a slice of docs.
-        available = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        if available == 0:
-            raise RuntimeError("--gpus requires CUDA devices")
-        if num_gpus > available:
-            print(f"warning: --gpus {num_gpus} > available GPUs ({available}), "
-                  f"using {available}")
-            args.gpus = available
-        _run_multi_gpu(args, doc_items, d_model, layer_index)
-        return
-
-    shard_id = getattr(args, "shard_id", None) or 0
-    num_shards = getattr(args, "num_shards", None) or 1
-    shard_slice = slice(
-        shard_id * len(doc_items) // num_shards,
-        (shard_id + 1) * len(doc_items) // num_shards if shard_id < num_shards - 1 else len(doc_items),
-    )
-    if num_shards > 1:
-        shard_output = f"{args.output}.shard_{shard_id:03d}"
+    # ---- shard split (optional) --------------------------------------------
+    shard_id = getattr(args, "shard_id", None)
+    num_shards = getattr(args, "num_shards", None)
+    if shard_id is not None and num_shards is not None:
+        n_docs = len(doc_items)
+        start = shard_id * n_docs // num_shards
+        end = (shard_id + 1) * n_docs // num_shards if shard_id < num_shards - 1 else n_docs
+        doc_items = doc_items[start:end]
+        output_path = f"{args.output}.shard_{shard_id:03d}"
+        shard_label = f"gpu {shard_id}/{num_shards}"
+        print(f"shard {shard_id}/{num_shards}: docs [{start}:{end}] → {output_path}")
     else:
-        shard_output = args.output
+        output_path = args.output
+        shard_label = "extracting"
 
-    # ---- run extraction on this shard ---------------------------------------
+    # ---- run extraction ----------------------------------------------------
     norms, n_written, n_skipped = _extract_shard(
-        doc_items[shard_slice],
+        doc_items,
         model=model,
         tokenizer=tokenizer,
         layers=layers,
@@ -182,15 +164,11 @@ def main() -> None:
         d_model=d_model,
         batch_size=args.batch_size,
         max_length=args.max_length,
-        output_path=shard_output,
-        shard_label=f"gpu {shard_id}" if num_shards > 1 else "extracting",
+        output_path=output_path,
+        shard_label=shard_label,
     )
 
-    # Multi-GPU handled by _run_multi_gpu which prints stats after merge.
-    if num_gpus > 1 and not getattr(args, "shard_id", None):
-        return
-
-    print(f"wrote {n_written} rows → {shard_output}")
+    print(f"wrote {n_written} rows → {output_path}")
     if n_skipped:
         print(f"  skipped {n_skipped} positions (token count mismatch after re-tokenization)")
     _print_norm_stats(norms)
@@ -253,7 +231,8 @@ def _extract_shard(
             attention_mask = enc["attention_mask"].to(device)
 
             captured = None
-            model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+            with torch.no_grad():
+                model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
             assert captured is not None, (
                 f"hook on layer {layer_index} did not fire — wrong architecture?"
             )
@@ -289,100 +268,6 @@ def _extract_shard(
     handle.remove()
     pbar.close()
     return norms, n_written, n_skipped
-
-
-def _run_multi_gpu(args, doc_items: list, d_model: int, layer_index: int) -> None:
-    """Spawn one process per GPU, merge shard outputs."""
-    import torch.multiprocessing as mp
-
-    num_gpus = args.gpus
-
-    def _worker(gpu_id: int) -> None:
-        """Run extraction on a single GPU slice."""
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
-        # Build args namespace for this worker
-        from argparse import Namespace
-        w_args = Namespace(
-            input=args.input, model_name=args.model_name,
-            layer_index=args.layer_index, output=args.output,
-            batch_size=args.batch_size, max_length=args.max_length,
-            device=f"cuda:0",  # CUDA_VISIBLE_DEVICES remaps to physical GPU
-            gpus=None, shard_id=gpu_id, num_shards=num_gpus,
-            config=None,
-        )
-        _run_shard(w_args, doc_items, d_model, layer_index)
-
-    print(f"launching {num_gpus} GPU workers ...")
-    mp.spawn(_worker, nprocs=num_gpus, join=True)
-
-    # Merge shard parquets
-    print("merging shard outputs ...")
-    tables = []
-    for gid in range(num_gpus):
-        shard_path = f"{args.output}.shard_{gid:03d}"
-        t = pq.read_table(shard_path)
-        tables.append(t)
-        Path(shard_path).unlink()
-    merged = pa.concat_tables(tables)
-    pq.write_table(merged, args.output)
-    print(f"merged {merged.num_rows} rows → {args.output}")
-
-    # Print norm stats
-    col = merged.column("activation_vector")
-    norms = [float(torch.linalg.norm(torch.tensor(v.as_py())).item()) for v in col]
-    _print_norm_stats(norms)
-
-
-def _run_shard(args, doc_items: list, d_model: int, layer_index: int) -> None:
-    """Load model on this GPU and extract vectors for our shard."""
-    # Detect device
-    if args.device:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    use_device_map = device.type == "cuda"
-
-    # Load model
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    tokenizer.padding_side = "right"
-    tokenizer.truncation_side = "right"
-
-    model_kwargs = dict(dtype=torch.bfloat16)
-    if use_device_map:
-        model_kwargs["device_map"] = "auto"
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name, **model_kwargs,
-    ).eval()
-    if not use_device_map:
-        model = model.to(device)
-
-    layers = _resolve_decoder_layers(model)
-
-    shard_id = args.shard_id or 0
-    num_shards = args.num_shards or 1
-    shard_slice = slice(
-        shard_id * len(doc_items) // num_shards,
-        (shard_id + 1) * len(doc_items) // num_shards
-        if shard_id < num_shards - 1 else len(doc_items),
-    )
-    shard_output = f"{args.output}.shard_{shard_id:03d}"
-
-    norms, n_written, n_skipped = _extract_shard(
-        doc_items[shard_slice],
-        model=model, tokenizer=tokenizer, layers=layers,
-        layer_index=layer_index, d_model=d_model,
-        batch_size=args.batch_size, max_length=args.max_length,
-        output_path=shard_output,
-        shard_label=f"gpu {shard_id}/{num_shards}",
-    )
-    print(f"[gpu {shard_id}] wrote {n_written} rows (skipped {n_skipped})")
 
 
 def _print_norm_stats(norms: list[float]) -> None:

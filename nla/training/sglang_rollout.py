@@ -72,12 +72,19 @@ class SGLangRollout:
         mem_fraction: float = 0.70,
         port: int = _DEFAULT_PORT,
         device: str = "cuda",
+        gpu_id: int | None = None,
         log_dir: str | None = None,
     ):
-        self.model_path = str(Path(model_path).resolve())
+        # Resolve local paths but keep HF repo names (e.g. "org/model") as-is
+        p = Path(model_path)
+        if p.exists():
+            self.model_path = str(p.resolve())
+        else:
+            self.model_path = model_path
         self.mem_fraction = mem_fraction
         self.port = port
         self.device = device
+        self.gpu_id = gpu_id
         self.log_dir = log_dir
         self._process: subprocess.Popen | None = None
         self._base_url = f"http://localhost:{port}"
@@ -99,7 +106,16 @@ class SGLangRollout:
             "--trust-remote-code",
         ]
         env = os.environ.copy()
-        env.setdefault("CUDA_VISIBLE_DEVICES", "0" if self.device == "cuda" else "")
+        # Determine which GPU SGLang should use:
+        #   gpu_id=N  → CUDA_VISIBLE_DEVICES=N
+        #   device="cuda:N"  → extract N
+        #   otherwise keep existing CUDA_VISIBLE_DEVICES
+        if self.gpu_id is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        elif self.device.startswith("cuda:") and self.device != "cuda":
+            env["CUDA_VISIBLE_DEVICES"] = self.device.split(":")[1]
+        else:
+            env.setdefault("CUDA_VISIBLE_DEVICES", "0" if self.device == "cuda" else "")
 
         if self.log_dir is None:
             self.log_dir = str(Path(self.model_path).parent / "sglang_logs")
@@ -109,6 +125,10 @@ class SGLangRollout:
         self._process = subprocess.Popen(
             cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT,
         )
+        self._wait_ready()
+
+    def wait_ready(self) -> None:
+        """Public entry point for externally-managed SGLang. Just poll /health."""
         self._wait_ready()
 
     def _wait_ready(self) -> None:
