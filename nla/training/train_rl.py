@@ -405,109 +405,11 @@ def train(args) -> None:
                 for msgs in messages_batch
             ]
 
-            # In DDP mode, gather all prompts to rank 0 for SGLang generation
-            if args.ddp and rollout is not None:
-                # Gather prompts and NORMALIZED vectors from all ranks to rank 0.
-                # Use tensor gather for vectors (faster and more reliable than object list).
-                all_messages = [None for _ in range(env.world_size)]
-                dist.all_gather_object(all_messages, messages_batch)
-
-                # Gather vectors as tensors: pad to same size then truncate
-                local_B = vectors.shape[0]
-                sizes = torch.tensor([local_B], device=env.device, dtype=torch.long)
-                all_sizes = [torch.zeros(1, dtype=torch.long, device=env.device) for _ in range(env.world_size)]
-                dist.all_gather(all_sizes, sizes)
-                max_B = max(int(s.item()) for s in all_sizes)
-
-                if local_B < max_B:
-                    pad = torch.zeros(max_B - local_B, vectors.shape[1], device=env.device, dtype=vectors.dtype)
-                    vectors_padded = torch.cat([vectors, pad], dim=0)
-                else:
-                    vectors_padded = vectors
-                all_vectors_tensor = [torch.zeros(max_B, vectors.shape[1], device=env.device, dtype=vectors.dtype) for _ in range(env.world_size)]
-                dist.all_gather(all_vectors_tensor, vectors_padded)
-
-                if env.is_main_process:
-                    flat_messages = [m for rank_msgs in all_messages for m in rank_msgs]
-                    all_sizes_list = [int(s.item()) for s in all_sizes]
-                    # Reconstruct flat vector list (drop padding)
-                    vecs_cpu = [t[:all_sizes_list[r]].cpu() for r, t in enumerate(all_vectors_tensor)]
-                    flat_vectors_tensor = torch.cat(vecs_cpu, dim=0).to(env.device)
-                    total_B = len(flat_messages)
-
-                    # Build embeddings for all prompts × N samples
-                    # Vectors already normalized; injection_scale=None to skip re-normalization
-                    embed_layer = (actor.module if args.ddp else actor).get_input_embeddings()
-                    embeds_list = []
-                    for i, (msgs, vec) in enumerate(zip(flat_messages, flat_vectors_tensor)):
-                        for _ in range(N):
-                            emb = prepare_batch_embeddings(
-                                tokenizer, [msgs], vec.unsqueeze(0),
-                                embed_layer,
-                                injection_char=injection_char,
-                                inj_token_id=inj_id,
-                                left_neighbor_id=left_id,
-                                right_neighbor_id=right_id,
-                                injection_scale=None,  # already normalized at line 397
-                                max_length=args.max_length,
-                                device=env.device,
-                            )
-                            embeds_list.append(emb[0])
-
-                    # Generate concurrently via SGLang
-                    sglang_responses = rollout.generate(
-                        embeds_list,
-                        max_new_tokens=args.max_response_len,
-                        temperature=1.0,
-                    )
-
-                    # Re-tokenize: split responses back per-prompt
-                    all_flat_prompt_texts = [
-                        tokenizer.apply_chat_template(msgs, tokenize=False,
-                                                      add_generation_prompt=True)
-                        for msgs in flat_messages
-                    ]
-                    all_responses = []
-                    all_tokens = []
-                    for idx, (ptext, sglang_text) in enumerate(
-                        zip(
-                            [pt for pt in all_flat_prompt_texts for _ in range(N)],
-                            sglang_responses,
-                        )
-                    ):
-                        all_responses.append(sglang_text)
-                        full_text = ptext + sglang_text
-                        full_ids = tokenizer(
-                            full_text, return_tensors="pt",
-                            truncation=True, max_length=args.max_length,
-                        )["input_ids"][0]
-                        all_tokens.append(full_ids)
-
-                    del embeds_list
-                else:
-                    all_responses = None
-                    all_tokens = None
-                    total_B = None
-
-                # Broadcast results back to all ranks
-                obj_to_bcast = (all_responses, all_tokens) if env.is_main_process else None
-                broadcast_list = [obj_to_bcast]
-                dist.broadcast_object_list(broadcast_list, src=0)
-                all_responses, all_tokens = broadcast_list[0]
-
-                # Scatter: each rank takes its own B*N slice
-                total_b_obj = [total_B] if env.is_main_process else [None]
-                dist.broadcast_object_list(total_b_obj, src=0)
-                total_B = total_b_obj[0]
-
-                rank_start = env.global_rank * B * N
-                rank_end = rank_start + B * N
-                all_responses = all_responses[rank_start:rank_end]
-                all_tokens = all_tokens[rank_start:rank_end]
-
-            elif rollout is not None:
-                # ---- Single-GPU SGLang rollout --------------------------------
-                embed_layer = actor.get_input_embeddings()
+            # Each rank independently generates via SGLang (no gather-broadcast).
+            # Vectors are already normalized at line 397.
+            if rollout is not None:
+                # ---- SGLang rollout (per-rank, no cross-rank comm) -------------
+                embed_layer = (actor.module if args.ddp else actor).get_input_embeddings()
                 embeds_list = []
                 for i, (msgs, vec) in enumerate(zip(messages_batch, vectors)):
                     for _ in range(N):
@@ -518,7 +420,7 @@ def train(args) -> None:
                             inj_token_id=inj_id,
                             left_neighbor_id=left_id,
                             right_neighbor_id=right_id,
-                            injection_scale=None,
+                            injection_scale=None,  # already normalized
                             max_length=args.max_length,
                             device=env.device,
                         )
@@ -530,11 +432,13 @@ def train(args) -> None:
                     temperature=1.0,
                 )
 
-                expected_texts = [ptext for ptext in prompt_texts for _ in range(N)]
                 all_responses = []
                 all_tokens = []
-                for i, (ptext, sglang_text) in enumerate(
-                    zip(expected_texts, sglang_responses)
+                for idx, (ptext, sglang_text) in enumerate(
+                    zip(
+                        [pt for pt in prompt_texts for _ in range(N)],
+                        sglang_responses,
+                    )
                 ):
                     all_responses.append(sglang_text)
                     full_text = ptext + sglang_text
@@ -543,6 +447,7 @@ def train(args) -> None:
                         truncation=True, max_length=args.max_length,
                     )["input_ids"][0]
                     all_tokens.append(full_ids)
+
                 del embeds_list
 
             else:
