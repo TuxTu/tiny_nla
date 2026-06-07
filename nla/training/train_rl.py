@@ -407,20 +407,36 @@ def train(args) -> None:
 
             # In DDP mode, gather all prompts to rank 0 for SGLang generation
             if args.ddp and rollout is not None:
-                # Gather prompts and vectors from all ranks to rank 0
+                # Gather prompts and NORMALIZED vectors from all ranks to rank 0.
+                # Use tensor gather for vectors (faster and more reliable than object list).
                 all_messages = [None for _ in range(env.world_size)]
-                all_vectors = [None for _ in range(env.world_size)]
                 dist.all_gather_object(all_messages, messages_batch)
-                dist.all_gather_object(all_vectors, vectors_batch)
+
+                # Gather vectors as tensors: pad to same size then truncate
+                local_B = vectors.shape[0]
+                sizes = torch.tensor([local_B], device=env.device, dtype=torch.long)
+                all_sizes = [torch.zeros(1, dtype=torch.long, device=env.device) for _ in range(env.world_size)]
+                dist.all_gather(all_sizes, sizes)
+                max_B = max(int(s.item()) for s in all_sizes)
+
+                if local_B < max_B:
+                    pad = torch.zeros(max_B - local_B, vectors.shape[1], device=env.device, dtype=vectors.dtype)
+                    vectors_padded = torch.cat([vectors, pad], dim=0)
+                else:
+                    vectors_padded = vectors
+                all_vectors_tensor = [torch.zeros(max_B, vectors.shape[1], device=env.device, dtype=vectors.dtype) for _ in range(env.world_size)]
+                dist.all_gather(all_vectors_tensor, vectors_padded)
 
                 if env.is_main_process:
-                    # Flatten and generate for all ranks combined
                     flat_messages = [m for rank_msgs in all_messages for m in rank_msgs]
-                    flat_vectors_list = [v for rank_vecs in all_vectors for v in rank_vecs]
-                    flat_vectors_tensor = torch.stack(flat_vectors_list).to(env.device)
+                    all_sizes_list = [int(s.item()) for s in all_sizes]
+                    # Reconstruct flat vector list (drop padding)
+                    vecs_cpu = [t[:all_sizes_list[r]].cpu() for r, t in enumerate(all_vectors_tensor)]
+                    flat_vectors_tensor = torch.cat(vecs_cpu, dim=0).to(env.device)
                     total_B = len(flat_messages)
 
                     # Build embeddings for all prompts × N samples
+                    # Vectors already normalized; injection_scale=None to skip re-normalization
                     embed_layer = (actor.module if args.ddp else actor).get_input_embeddings()
                     embeds_list = []
                     for i, (msgs, vec) in enumerate(zip(flat_messages, flat_vectors_tensor)):
@@ -432,7 +448,7 @@ def train(args) -> None:
                                 inj_token_id=inj_id,
                                 left_neighbor_id=left_id,
                                 right_neighbor_id=right_id,
-                                injection_scale=None,
+                                injection_scale=None,  # already normalized at line 397
                                 max_length=args.max_length,
                                 device=env.device,
                             )
@@ -616,13 +632,15 @@ def train(args) -> None:
 
                 for i, s_idx in enumerate(valid_indices):
                     gold_idx = s_idx // N
+                    if gold_idx >= len(vectors):
+                        continue  # safety: scatter may have fewer vectors than expected
                     gold_vec = vectors[gold_idx]
                     mse = F.mse_loss(
                         normalize_activation(preds[i:i+1], mse_scale),
                         normalize_activation(gold_vec.unsqueeze(0), mse_scale),
                     )
-                    # Replace placeholder with actual reward
-                    rewards[s_idx] = -mse.item()
+                    if s_idx < len(rewards):
+                        rewards[s_idx] = -mse.item()
 
             rewards_t = torch.tensor(rewards, device=env.device).float()
             reward_history.append(rewards_t.mean().item())

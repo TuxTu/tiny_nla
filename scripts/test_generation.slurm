@@ -65,8 +65,13 @@ for i in range(N_TEST):
     prompt_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
     prompt_t = torch.tensor([prompt_ids], device="cuda:0")
 
-    # Inject activation vector via hook (uses actual input_ids from args[0])
-    vec = torch.from_numpy(vectors_np[i]).to("cuda:0").unsqueeze(0)
+    # Inject activation vector via hook (normalized to match training: 2.5*sqrt(d_model))
+    import math
+    d_model = sidecar["extraction"]["d_model"]
+    injection_scale = 2.5 * math.sqrt(d_model)
+    raw_vec = torch.from_numpy(vectors_np[i]).float()
+    vec_norm = raw_vec.norm()
+    vec = (raw_vec / (vec_norm / injection_scale)).to(torch.bfloat16).unsqueeze(0).to("cuda:0")
     def _make_gen_hook(_vec, _inj_id, _left_id, _right_id):
         def _hook(module, args, output):
             actual_ids = args[0]
