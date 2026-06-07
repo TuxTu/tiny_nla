@@ -96,7 +96,10 @@ def load_models(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # Load injection metadata from sidecar
+    # Load injection metadata from sidecar.
+    # read_sidecar appends .nla_meta.yaml, so strip if already present.
+    if sidecar_path.endswith(".nla_meta.yaml"):
+        sidecar_path = sidecar_path[: -len(".nla_meta.yaml")]
     sidecar = read_sidecar(sidecar_path)
     tokens = sidecar["tokens"]
     d_model = sidecar["extraction"]["d_model"]
