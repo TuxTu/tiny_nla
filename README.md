@@ -37,9 +37,7 @@ configs/
 
 ## Pre-labeled Dataset
 
-[`TuHan/qwen3-nla-250k`](https://huggingface.co/datasets/TuHan/qwen3-nla-250k) is a pre-labeled NLA dataset for the Qwen3 tokenizer family (0.6B, 1.7B, 4B, 8B). It contains 250k FineWeb text snippets, each labeled by **DeepSeek V4 Flash** with a structured explanation of what semantic/structural signal a language model's activation vector encodes at that position.
-
-Labels were generated at a cost of ~$0.42 per 1M tokens ($0.14 input / $0.28 output), making the full 250k-document labeling run cost ~$15 in API credits.
+[`TuHan/qwen3-nla-250k`](https://huggingface.co/datasets/TuHan/qwen3-nla-250k) is a pre-labeled NLA dataset for the Qwen3 tokenizer family (0.6B, 1.7B, 4B, 8B). It contains 250k FineWeb text snippets (~499k labeled rows), each annotated by **DeepSeek V4 Flash** with a structured explanation of what semantic/structural signal a language model's activation vector encodes at that position.
 
 ### Dataset structure
 
@@ -51,13 +49,13 @@ Dataset: TuHan/qwen3-nla-250k  (499k rows)
 └── api_explanation               Structured explanation (DeepSeek V4 Flash)
 ```
 
-Each `api_explanation` describes 2-3 semantic features of the activation vector — syntactic constraints, topic continuation, register shifts, or entity tracking — in free-form natural language. The text positions are sampled across 50k FineWeb documents (5 positions per doc) and deterministically split:
+Each `api_explanation` describes 2-3 semantic features of the activation vector — syntactic constraints, topic continuation, register shifts, or entity tracking — in free-form natural language. The text positions are sampled across 50k FineWeb documents (5 positions per doc), producing ~499k labeled rows deterministically split:
 
 | Split | Rows | Purpose |
 |-------|------|---------|
-| AV-SFT | 62.5k | Train actor: vector → explanation |
-| AR-SFT | 62.5k | Train critic: explanation → vector |
-| RL | 125k | GRPO fine-tuning (on-policy) |
+| AV-SFT | 125k | Train actor: vector → explanation |
+| AR-SFT | 125k | Train critic: explanation → vector |
+| RL | 250k | GRPO fine-tuning (on-policy) |
 
 ### Using the dataset
 
