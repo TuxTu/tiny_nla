@@ -356,28 +356,34 @@ def train(args) -> None:
             prepare_batch_embeddings,
         )
 
-        # Only the main process manages SGLang
+        sglang_gpu = getattr(args, "sglang_gpu_id", None)
+
+        # Initial save so SGLang has weights to load (rank 0 only)
         if env.is_main_process:
-            # Initial save so SGLang has weights to load
             _actor_save = actor.module if args.ddp else actor
             _actor_save.save_pretrained(str(actor_save))
             tokenizer.save_pretrained(str(actor_save))
 
-            sglang_gpu = getattr(args, "sglang_gpu_id", None)
-
-            rollout = SGLangRollout(
-                str(actor_save),
-                mem_fraction=getattr(args, "sglang_mem_fraction", 0.70),
-                gpu_id=sglang_gpu,
-            )
-            if getattr(args, "sglang_external", False):
-                # SGLang was launched externally (e.g. by SLURM script on GPU 0
-                # before torchrun). Just verify it's healthy.
-                rollout.wait_ready()
+        # ALL ranks create a rollout object — each rank calls SGLang
+        # independently for per-rank generation (no cross-rank gather needed).
+        rollout = SGLangRollout(
+            str(actor_save),
+            mem_fraction=getattr(args, "sglang_mem_fraction", 0.70),
+            gpu_id=sglang_gpu,
+        )
+        if getattr(args, "sglang_external", False):
+            # SGLang was launched externally (e.g. by SLURM script on GPU 0
+            # before torchrun). All ranks verify it's healthy.
+            rollout.wait_ready()
+            if env.is_main_process:
                 print(f"SGLang (external) ready on GPU {sglang_gpu}.")
-            else:
+        else:
+            # Only rank 0 launches SGLang; other ranks wait for it
+            if env.is_main_process:
                 rollout.start()
                 print(f"SGLang server started on GPU {sglang_gpu} (will hot-reload weights each step).")
+            else:
+                rollout.wait_ready()
 
     # ---- training loop -------------------------------------------------------
     global_step = 0
