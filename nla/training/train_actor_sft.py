@@ -233,7 +233,8 @@ def train(args) -> None:
 
     # ---- training ------------------------------------------------------------
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    global_step = 0
+    opt_step = 0          # counts optimizer steps (= global_step in original)
+    micro_step = 0         # counts micro-batches for grad_accum
     losses = []
 
     def _save():
@@ -243,12 +244,12 @@ def train(args) -> None:
         model_to_save = model.module if args.ddp else model
         model_to_save.save_pretrained(str(save_dir))
         tokenizer.save_pretrained(str(save_dir))
-        print(f"  checkpoint saved → {save_dir}  (step {global_step})")
+        print(f"  checkpoint saved → {save_dir}  (step {opt_step})")
 
-    while global_step < args.num_steps:
+    while opt_step < args.num_steps:
         if sampler is not None:
-            sampler.set_epoch(global_step)
-        pbar = tqdm(dl, desc=f"actor  step={global_step}/{args.num_steps}",
+            sampler.set_epoch(opt_step)
+        pbar = tqdm(dl, desc=f"actor  step={opt_step}/{args.num_steps}",
                     disable=not env.is_main_process)
         any_data = False
         accum_loss = 0.0
@@ -256,7 +257,7 @@ def train(args) -> None:
 
         for messages_batch, responses_batch, vectors_batch in pbar:
             any_data = True
-            if global_step >= args.num_steps:
+            if opt_step >= args.num_steps:
                 break
 
             model_fwd = model.module if args.ddp else model
@@ -322,25 +323,30 @@ def train(args) -> None:
 
             loss.backward()
             accum_loss += loss.item() * grad_accum
+            micro_step += 1
 
-            if ((global_step + 1) % grad_accum == 0) or (global_step + 1 >= args.num_steps):
+            # Optimizer step after grad_accum micro-batches
+            if (micro_step % grad_accum == 0) or (opt_step >= args.num_steps - 1 and accum_loss > 0):
                 optimizer.step()
                 optimizer.zero_grad()
                 if lr_scheduler is not None:
                     lr_scheduler.step()
 
-            if env.is_mps and global_step % 5 == 0:
-                torch.mps.empty_cache()
+                losses.append(accum_loss)
+                current_lr = optimizer.param_groups[0]["lr"]
+                if env.is_main_process:
+                    pbar.set_postfix(loss=f"{accum_loss:.4f}", lr=f"{current_lr:.2e}")
+                accum_loss = 0.0
+                opt_step += 1
 
-            if global_step % args.save_every == 0 and global_step > 0:
-                _save()
+                if env.is_mps and opt_step % 5 == 0:
+                    torch.mps.empty_cache()
 
-            current_lr = optimizer.param_groups[0]["lr"]
-            losses.append(accum_loss)
-            if env.is_main_process:
-                pbar.set_postfix(loss=f"{accum_loss:.4f}", lr=f"{current_lr:.2e}")
-            accum_loss = 0.0
-            global_step += 1
+                if opt_step % args.save_every == 0 and opt_step > 0:
+                    _save()
+
+            if opt_step >= args.num_steps:
+                break
 
         if not any_data:
             if env.is_main_process:

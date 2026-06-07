@@ -126,6 +126,26 @@ def _broadcast_object(obj, env: EnvConfig, src: int = 0):
     return buffer[0]
 
 
+def _truncate_to_cross_rank_min(tokens_list: list, env) -> int:
+    """All-reduce valid-sample count to cross-rank MIN and truncate.
+
+    After filtering (e.g. skipping invalid explanations), each rank may have a
+    different number of valid samples.  Different counts → different forward-pass
+    counts → DDP gradient-allreduce desync → NCCL timeout (hang).
+
+    Returns n_min: the count to use (same across all ranks after truncation).
+    """
+    n = torch.tensor([len(tokens_list)], device=env.device, dtype=torch.long)
+    dist.all_reduce(n, op=dist.ReduceOp.MIN)
+    n_min = int(n.item())
+    if n_min == 0:
+        # If any rank has zero valid, all ranks skip this step
+        return 0
+    # Truncate in-place
+    del tokens_list[n_min:]
+    return n_min
+
+
 # ---------------------------------------------------------------------------
 # training loop
 # ---------------------------------------------------------------------------
@@ -239,7 +259,7 @@ def train(args) -> None:
 
     if args.ddp:
         actor = DDP(actor, device_ids=[env.local_rank] if torch.cuda.is_available() else None,
-                    find_unused_parameters=True)
+                    find_unused_parameters=False)
 
     if env.is_main_process:
         a = actor.module if args.ddp else actor
@@ -700,7 +720,6 @@ def train(args) -> None:
 
             critic_batch_inputs = []
             critic_batch_gold = []
-            critic_batch_count = 0
             for s in range(B * N):
                 explanation = extract_explanation(all_responses[s])
                 if explanation is None:
@@ -713,7 +732,16 @@ def train(args) -> None:
                 critic_batch_inputs.append((critic_enc["input_ids"][0], critic_enc["attention_mask"][0]))
                 gold_idx = s // N
                 critic_batch_gold.append(vectors[gold_idx])
-                critic_batch_count += 1
+
+            # Cross-rank min truncation: ensures all ranks have the same number
+            # of valid critic samples → same forward-pass count → no DDP hang.
+            if args.ddp and env.world_size > 1:
+                n_critic = _truncate_to_cross_rank_min(critic_batch_inputs, env)
+                if n_critic > 0:
+                    del critic_batch_gold[n_critic:]
+                critic_batch_count = n_critic
+            else:
+                critic_batch_count = len(critic_batch_inputs)
 
             if critic_batch_count > 0:
                 # Pad and batch
