@@ -218,6 +218,81 @@ DeepSeek v4-flash is ~11× cheaper and outperforms Haiku 4.5 on SWE-bench (79.0 
 ## Hardware
 
 Qwen3-0.6B fits on any single GPU (Colab T4/L4/A100, Apple Silicon). Data generation is CPU-only.
+For Qwen3-4B RL training, we used 8× A100 80GB (GPU0=SGLang, GPU1-7=DDP training).
+
+## Model & training config (Qwen3-4B)
+
+| Setting | Value |
+|---------|-------|
+| Base model | Qwen3-4B (36 layers, d_model=2560, GQA 32Q/8KV) |
+| Critic | 25 layers (2/3 truncated) + value_head, identity-init |
+| Injection | char `㈎`, scale `2.5 × √d_model = 126.49` |
+| Extraction layer | 24 (2/3 × 36) |
+| SFT (actor) | 250 steps, global_batch=256, 4×A100 DDP, CE loss |
+| SFT (critic) | 250 steps, global_batch=256, 4×A100 DDP, MSE loss |
+| RL (GRPO) | rollout_batch=2, n_samples=8, 7×A100 DDP + 1×A100 SGLang |
+| Optimizer | ZeroRedundancyOptimizer (AdamW, lr=1.41e-5 constant) |
+| max-response-len | 256 tokens |
+
+## SFT baseline (Qwen3-4B)
+
+| Metric | Actor SFT | Critic SFT |
+|--------|----------|-----------|
+| Training data | 125k rows | 125k rows |
+| Steps | 250 | 250 |
+| Final loss | CE 19.78 | MSE 1.06 |
+| Extraction rate (greedy) | 100% | — |
+| **FVE_nrm** | — | **−0.32** |
+| **FVE_nrm_meannorm** | — | **−0.08** |
+
+The critic FVE is negative — it predicts vectors *worse* than a constant
+mean predictor.  To isolate whether the actor or critic is at fault, we
+evaluated the critic directly on the API-labeled explanations (skipping
+the actor entirely):
+
+| Evaluation path | FVE_nrm | MSE |
+|----------------|---------|-----|
+| Full pipeline (actor → critic) | −0.32 | 0.774 |
+| **Critic only** (API labels → critic) | **−0.22** | 0.680 |
+
+Even with perfect API-labeled explanations, the critic cannot beat the
+mean predictor.  The 4B critic (25/36 layers) is too small for
+text→vector prediction.  This is a capacity limitation, not an actor
+or training bug.
+
+## RL Experiments — Bitter Lesson
+
+We ran 7 GRPO RL attempts on Qwen3-4B with different KL configurations.
+All used the same SFT checkpoints, 250k-row dataset, and 8× A100 GPUs.
+**Every run mode-collapsed within 10–125 steps.**
+
+| Run | KL type | kl_coef | Freeze critic? | Steps survived |
+|-----|---------|---------|---------------|---------------|
+| 1 | per_seq (signed) | 0.01 | No | ~20 (then fallbacks) |
+| 2 | per_seq (signed) | 0.01 | No | ~125 (collapsed at eval) |
+| 3 | per_seq (squared) | 0.01 | No | ~10 |
+| 4 | per_seq (squared) | 0.1 | No | ~10 |
+| 5 | per_seq (squared) | 1.0 | No | ~10 |
+| 6 | per_seq (squared) | 0.1 | **Yes** | ~25 (collapsed at eval) |
+| 7 | per_token (squared) | 0.1 | No | ~10 |
+
+During training (SGLang path), rewards improved from −1.1 to −0.8 with
+100% extraction.  At evaluation (HF generate), every checkpoint produced
+degenerate output: `!!!!!!`, Chinese repetition, bilingual fragments.
+
+The root cause: SGLang rollout (`input_embeds`) and HF generate
+(`input_ids` + hook) produce different output distributions.  On a 4B
+model, RL learns SGLang-specific patterns that don't transfer.  Combined
+with a critic that can't beat the mean predictor (FVE < 0), the GRPO
+signal is too noisy to improve explanation quality.
+
+### What works
+
+- **SFT training:** Actor (CE 19.78) and critic (MSE 1.06) train stably.
+  The SFT actor produces coherent `<explanation>` tags with greedy decoding.
+- **Data pipeline:** 250k labeled positions, reusable across Qwen3 family.
+- **RL infrastructure:** SGLang rollout, GRPO, ZeroRedundancyOptimizer,
+  DDP with DistributedSampler, checkpoint snapshots — all working.
 
 ## License
 
