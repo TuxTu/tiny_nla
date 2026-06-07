@@ -255,9 +255,7 @@ def nla_predict_explanation_and_ar(
 
     # ── 2. Critic: predict AR vector ─────────────────────────────────
     critic_prompt = (
-        "You are given a description of an activation vector. Predict the vector.\n\n"
-        f"Description: {explanation}\n\n"
-        "The predicted vector is:"
+        f"Summary of the following text: <text>{explanation}</text> <summary>"
     )
     critic_enc = tokenizer(critic_prompt, return_tensors="pt", truncation=True, max_length=512)
     c_ids = critic_enc["input_ids"].to(device)

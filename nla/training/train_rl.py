@@ -316,14 +316,21 @@ def train(args) -> None:
     if args.ddp:
         critic = critic.to(env.device)
 
-    critic.train()
+    if args.freeze_critic:
+        critic.eval()
+        for p in critic.parameters():
+            p.requires_grad = False
+        if env.is_main_process:
+            print("critic: FROZEN (no co-adaptation)")
+    else:
+        critic.train()
 
-    if args.ddp:
+    if args.ddp and not args.freeze_critic:
         critic = DDP(critic, device_ids=[env.local_rank] if torch.cuda.is_available() else None,
                      find_unused_parameters=False)
 
     if env.is_main_process:
-        c = critic.module if args.ddp else critic
+        c = (critic.module if args.ddp and not args.freeze_critic else critic)
         print(f"critic: {c.config.num_hidden_layers} layers")
 
     # ---- optimizers (ZeroRedundancyOptimizer shards states across ranks) ----
@@ -335,18 +342,24 @@ def train(args) -> None:
             optimizer_class=torch.optim.AdamW,
             lr=args.lr_actor,
         )
-        critic_optimizer = ZeroRedundancyOptimizer(
-            critic.parameters(),
-            optimizer_class=torch.optim.AdamW,
-            lr=args.lr_critic,
-        )
+        if not args.freeze_critic:
+            critic_optimizer = ZeroRedundancyOptimizer(
+                critic.parameters(),
+                optimizer_class=torch.optim.AdamW,
+                lr=args.lr_critic,
+            )
+        else:
+            critic_optimizer = None
     else:
         actor_optimizer = torch.optim.AdamW(
             actor.parameters(), lr=args.lr_actor,
         )
-        critic_optimizer = torch.optim.AdamW(
-            critic.parameters(), lr=args.lr_critic,
-        )
+        if not args.freeze_critic:
+            critic_optimizer = torch.optim.AdamW(
+                critic.parameters(), lr=args.lr_critic,
+            )
+        else:
+            critic_optimizer = None
     if env.is_main_process:
         print(f"actor_lr={args.lr_actor}  critic_lr={args.lr_critic}  "
               f"kl_coef={args.kl_coef}  n_samples={args.n_samples}  "
@@ -403,7 +416,7 @@ def train(args) -> None:
         if not env.is_main_process:
             return
         _actor_save = actor.module if args.ddp else actor
-        _critic_save = critic.module if args.ddp else critic
+        _critic_save = (critic.module if args.ddp and not args.freeze_critic else critic)
         _actor_save.save_pretrained(str(actor_save))
         _critic_save.save_pretrained(str(critic_save))
         tokenizer.save_pretrained(str(actor_save))
@@ -540,7 +553,7 @@ def train(args) -> None:
             # ================================================================
             # 2. REWARD via critic (batched for efficiency)
             # ================================================================
-            _critic = critic.module if args.ddp else critic
+            _critic = (critic.module if args.ddp and not args.freeze_critic else critic)
             # Pre-allocate ALL rewards at the fallback value (matches original NLA
             # reward.py: rewards = [FAILED_EXTRACTION_REWARD] * len(samples)).
             # Valid explanations overwrite their slot; failed/truncated/missing
@@ -643,13 +656,15 @@ def train(args) -> None:
                                     -1, target_ids.unsqueeze(-1)
                                 ).squeeze(-1)
                                 ref_seq_log_prob = ref_token_log_probs.sum()
-                                # KL as squared log-ratio: always ≥ 0, pushes
-                                # toward the reference in BOTH directions.
-                                # (seq_log - ref_log)² = (log π_new/π_ref)²
-                                # approximates KL for small deviations but
-                                # never becomes a "KL reward" that accelerates
-                                # divergence when the sign flips.
-                                kl_loss = (seq_log_prob - ref_seq_log_prob) ** 2
+                                if args.kl_type == "per_token":
+                                    # Per-token KL (VeRL/TRL/OpenRLHF standard):
+                                    # mean((logP - logPref)²) over all tokens.
+                                    # Always ≥ 0, penalises token-level drift.
+                                    kl_loss = (token_log_probs - ref_token_log_probs).pow(2).mean()
+                                else:
+                                    # Per-sequence KL:
+                                    # (ΣlogP - ΣlogPref)² — one scalar per sequence.
+                                    kl_loss = (seq_log_prob - ref_seq_log_prob) ** 2
 
                         pg_loss = -(advantages[s] * seq_log_prob)
                         loss = pg_loss + args.kl_coef * kl_loss
@@ -678,55 +693,56 @@ def train(args) -> None:
             # 5. CRITIC UPDATE (batched MSE)
             # ================================================================
             critic_loss_sum = 0.0
-            critic_optimizer.zero_grad()
 
-            critic_batch_inputs = []
-            critic_batch_gold = []
-            for s in range(B * N):
-                explanation = extract_explanation(all_responses[s])
-                if explanation is None:
-                    continue
-                critic_prompt = critic_template.format(explanation=explanation)
-                critic_enc = tokenizer(
-                    critic_prompt, return_tensors="pt",
-                    truncation=True, max_length=512,
-                )
-                critic_batch_inputs.append((critic_enc["input_ids"][0], critic_enc["attention_mask"][0]))
-                gold_idx = s // N
-                critic_batch_gold.append(vectors[gold_idx])
+            if not args.freeze_critic:
+                critic_optimizer.zero_grad()
 
-            # Cross-rank min truncation: ensures all ranks have the same number
-            # of valid critic samples → same forward-pass count → no DDP hang.
-            if args.ddp and env.world_size > 1:
-                n_critic = _truncate_to_cross_rank_min(critic_batch_inputs, env)
-                if n_critic > 0:
-                    del critic_batch_gold[n_critic:]
-                critic_batch_count = n_critic
-            else:
-                critic_batch_count = len(critic_batch_inputs)
+                critic_batch_inputs = []
+                critic_batch_gold = []
+                for s in range(B * N):
+                    explanation = extract_explanation(all_responses[s])
+                    if explanation is None:
+                        continue
+                    critic_prompt = critic_template.format(explanation=explanation)
+                    critic_enc = tokenizer(
+                        critic_prompt, return_tensors="pt",
+                        truncation=True, max_length=512,
+                    )
+                    critic_batch_inputs.append((critic_enc["input_ids"][0], critic_enc["attention_mask"][0]))
+                    gold_idx = s // N
+                    critic_batch_gold.append(vectors[gold_idx])
 
-            if critic_batch_count > 0:
-                # Pad and batch
-                c_ids_batch = torch.nn.utils.rnn.pad_sequence(
-                    [ci[0] for ci in critic_batch_inputs], batch_first=True, padding_value=0
-                ).to(env.device)
-                c_mask_batch = torch.nn.utils.rnn.pad_sequence(
-                    [ci[1] for ci in critic_batch_inputs], batch_first=True, padding_value=0
-                ).to(env.device)
-                gold_batch = torch.stack(critic_batch_gold).to(env.device)
+                # Cross-rank min truncation
+                if args.ddp and env.world_size > 1:
+                    n_critic = _truncate_to_cross_rank_min(critic_batch_inputs, env)
+                    if n_critic > 0:
+                        del critic_batch_gold[n_critic:]
+                    critic_batch_count = n_critic
+                else:
+                    critic_batch_count = len(critic_batch_inputs)
 
-                with torch.autocast(device_type=env.device.type, dtype=env.dtype,
-                                    enabled=env.amp_enabled):
-                    _critic_fwd = critic.module if args.ddp else critic
-                    c_out = _critic_fwd(input_ids=c_ids_batch, attention_mask=c_mask_batch)
-                    seq_lens = c_mask_batch.sum(dim=1) - 1
-                    pred = c_out.values[torch.arange(len(seq_lens)), seq_lens]
-                    c_loss = nla_critic_loss(pred, gold_batch, mse_scale)
+                if critic_batch_count > 0:
+                    c_ids_batch = torch.nn.utils.rnn.pad_sequence(
+                        [ci[0] for ci in critic_batch_inputs], batch_first=True, padding_value=0
+                    ).to(env.device)
+                    c_mask_batch = torch.nn.utils.rnn.pad_sequence(
+                        [ci[1] for ci in critic_batch_inputs], batch_first=True, padding_value=0
+                    ).to(env.device)
+                    gold_batch = torch.stack(critic_batch_gold).to(env.device)
 
-                c_loss.backward()
-                critic_loss_sum = c_loss.detach().item()
+                    with torch.autocast(device_type=env.device.type, dtype=env.dtype,
+                                        enabled=env.amp_enabled):
+                        _critic_fwd = (critic.module if args.ddp and not args.freeze_critic else critic)
+                        c_out = _critic_fwd(input_ids=c_ids_batch, attention_mask=c_mask_batch)
+                        seq_lens = c_mask_batch.sum(dim=1) - 1
+                        pred = c_out.values[torch.arange(len(seq_lens)), seq_lens]
+                        c_loss = nla_critic_loss(pred, gold_batch, mse_scale)
 
-            critic_optimizer.step()
+                    c_loss.backward()
+                    critic_loss_sum = c_loss.detach().item()
+
+                critic_optimizer.step()
+
             critic_losses.append(critic_loss_sum / max(1, B * N))
 
             if env.is_mps and global_step % 5 == 0:
@@ -794,6 +810,11 @@ def main() -> None:
     p.add_argument("--lr-critic", type=float, default=1.41e-5)
     p.add_argument("--kl-coef", type=float, default=0.01,
                    help="KL penalty coefficient (0=disabled)")
+    p.add_argument("--kl-type", type=str, default="per_seq",
+                   choices=["per_seq", "per_token"],
+                   help="per_seq: (ΣlogP−ΣlogPref)²  per_token: mean((logP−logPref)²)")
+    p.add_argument("--freeze-critic", action="store_true",
+                   help="Freeze critic during RL (prevents co-adaptation)")
     p.add_argument("--max-response-len", type=int, default=150)
     p.add_argument("--max-length", type=int, default=2048)
     p.add_argument("--num-steps", type=int, default=2)

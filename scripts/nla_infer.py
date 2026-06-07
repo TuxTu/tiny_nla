@@ -293,11 +293,9 @@ def nla_translate(
 
     # ── 2. Critic: predict AR vector from explanation ───────────────────
     if explanation is not None:
-        critic_prompt = (
-            "You are given a description of an activation vector. Predict the vector.\n\n"
-            f"Description: {explanation}\n\n"
-            "The predicted vector is:"
-        )
+        # Matches training critic_template (sidecar fallback):
+        # "Summary of the following text: <text>{explanation}</text> <summary>"
+        critic_prompt = f"Summary of the following text: <text>{explanation}</text> <summary>"
 
         critic_enc = tokenizer(critic_prompt, return_tensors="pt", truncation=True,
                               max_length=512)
