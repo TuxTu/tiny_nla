@@ -37,7 +37,9 @@ configs/
 
 ## Pre-labeled Dataset
 
-[`TuHan/qwen3-nla-250k`](https://huggingface.co/datasets/TuHan/qwen3-nla-250k) is a pre-labeled NLA dataset for the Qwen3 tokenizer family (0.6B, 1.7B, 4B, 8B). It contains 250k FineWeb text snippets, each annotated with a structured explanation of what semantic/structural signal a language model's activation vector encodes at that position.
+[`TuHan/qwen3-nla-250k`](https://huggingface.co/datasets/TuHan/qwen3-nla-250k) is a pre-labeled NLA dataset for the Qwen3 tokenizer family (0.6B, 1.7B, 4B, 8B). It contains 250k FineWeb text snippets, each labeled by **DeepSeek V4 Flash** with a structured explanation of what semantic/structural signal a language model's activation vector encodes at that position.
+
+Labels were generated at a cost of ~$0.42 per 1M tokens ($0.14 input / $0.28 output), making the full 250k-document labeling run cost ~$15 in API credits.
 
 ### Dataset structure
 
@@ -46,7 +48,7 @@ Dataset: TuHan/qwen3-nla-250k  (499k rows)
 ├── doc_id                        FineWeb document identifier
 ├── n_raw_tokens                  Token count in the context window
 ├── detokenized_text_truncated    Text snippet for AV extraction
-└── api_explanation               Structured explanation (labeled by DeepSeek)
+└── api_explanation               Structured explanation (DeepSeek V4 Flash)
 ```
 
 Each `api_explanation` describes 2-3 semantic features of the activation vector — syntactic constraints, topic continuation, register shifts, or entity tracking — in free-form natural language. The text positions are sampled across 50k FineWeb documents (5 positions per doc) and deterministically split:
