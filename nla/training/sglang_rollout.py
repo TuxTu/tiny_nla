@@ -284,12 +284,12 @@ class SGLangRollout:
             assert embeds.shape[0] == 1, (
                 f"input_embeds[{i}] batch dim must be 1, got {embeds.shape[0]}"
             )
-            buf = io.BytesIO()
-            torch.save(embeds.cpu(), buf)
-            payload_b64 = _encode_bytes(buf.getvalue())
+            # Send as nested list — SGLang GenerateReqInput natively supports
+            # input_embeds as List[List[List[float]]].  The bf16→float conversion
+            # is ~2× memory but avoids patching SGLang.
+            embeds_list = embeds[0].float().tolist()  # [seq_len, d_model] → nested list
             body = json.dumps({
-                "input_embeds": payload_b64,
-                "input_embeds_shape": list(embeds.shape),
+                "input_embeds": embeds_list,
                 "sampling_params": sampling_params,
             }).encode("utf-8")
             payloads.append(body)
