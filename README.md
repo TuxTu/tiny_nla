@@ -5,6 +5,31 @@ Natural Language Autoencoders pipeline for small HuggingFace models (< 4B).
 Decoupled labeling → reusable across any model sharing a Qwen3 tokenizer.
 Training pipeline: critic SL → actor SFT → GRPO RL, using only HF Transformers + PyTorch.
 
+## Design
+
+This is a from-scratch reimplementation of the NLA pipeline, not a fork of Anthropic's
+original [Miles](https://github.com/anthropics/natural_language_autoencoders) framework.
+Two design choices drive this:
+
+**1. Data parallelism instead of model parallelism.**
+Miles targets models large enough to require FSDP or Megatron-style sharding across
+multiple GPUs. tiny_nla targets models that *fit on a single GPU* (≤ 4B parameters).
+Instead of sharding one giant model, we run one copy per GPU and use PyTorch DDP
+with a DistributedSampler — each rank sees unique data, gradients are averaged.
+This gives linear throughput scaling up to the GPU count with standard PyTorch
+primitives and no framework lock-in.
+
+**2. Decoupled labeling keeps training cheap.**
+API-labeled explanations are tied to a *tokenizer*, not a specific model. All Qwen3
+variants (0.6B–8B) share the same tokenizer, so the same 250k labeled positions
+work for the entire family. You only pay for labeling once, then extract vectors
+from whatever model you want to train. This cuts the dominant cost (API calls) by
+an order of magnitude compared to per-model labeling.
+
+Together these choices make NLA training practical on a single 8-GPU node with
+commodity hardware — no InfiniBand, no Ray cluster, no Megatron — while still
+producing models that transfer across the Qwen3 family.
+
 ## Architecture
 
 ```
