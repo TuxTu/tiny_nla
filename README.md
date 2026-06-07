@@ -35,6 +35,58 @@ configs/
   train_0.6b.yaml             Training: critic + actor + RL
 ```
 
+## Pre-labeled Dataset
+
+[`TuHan/qwen3-nla-250k`](https://huggingface.co/datasets/TuHan/qwen3-nla-250k) is a pre-labeled NLA dataset for the Qwen3 tokenizer family (0.6B, 1.7B, 4B, 8B). It contains 250k FineWeb text snippets, each annotated with a structured explanation of what semantic/structural signal a language model's activation vector encodes at that position.
+
+### Dataset structure
+
+```
+Dataset: TuHan/qwen3-nla-250k  (499k rows)
+├── doc_id                        FineWeb document identifier
+├── n_raw_tokens                  Token count in the context window
+├── detokenized_text_truncated    Text snippet for AV extraction
+└── api_explanation               Structured explanation (labeled by DeepSeek)
+```
+
+Each `api_explanation` describes 2-3 semantic features of the activation vector — syntactic constraints, topic continuation, register shifts, or entity tracking — in free-form natural language. The text positions are sampled across 50k FineWeb documents (5 positions per doc) and deterministically split:
+
+| Split | Rows | Purpose |
+|-------|------|---------|
+| AV-SFT | 62.5k | Train actor: vector → explanation |
+| AR-SFT | 62.5k | Train critic: explanation → vector |
+| RL | 125k | GRPO fine-tuning (on-policy) |
+
+### Using the dataset
+
+```python
+from datasets import load_dataset
+
+ds = load_dataset("TuHan/qwen3-nla-250k", split="train")
+# ds[0]:
+# {
+#   "doc_id": "HuggingFaceFW/fineweb:train:2",
+#   "n_raw_tokens": 210,
+#   "detokenized_text_truncated": "A novel two-step immunotherapy approach...",
+#   "api_explanation": "Syntactic/structural constraints: the conjunction..."
+# }
+```
+
+### Compatibility
+
+The dataset is **tokenizer-bound** — labels embed token IDs from Qwen3's vocabulary. All Qwen3 variants (0.6B-8B) share the same tokenizer, so the labels work across the entire model family. A SHA-256 tokenizer fingerprint is embedded in every output parquet for downstream verification.
+
+To extract activation vectors from your own model:
+
+```bash
+# Extract hidden states at labeled positions (works with any Qwen3 model)
+python -m nla.datagen.extract_vectors \
+    --explained data/av_sft_explained.parquet \
+    --model Qwen/Qwen3-4B --output data/av_sft_vectors.parquet
+```
+
+Then build training-ready parquets with `build_training_data.py` (see Quick Start below).
+
 ## Quick Start
 
 ```bash
