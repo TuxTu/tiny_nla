@@ -54,6 +54,14 @@ from nla.training.schema import (
 )
 from nla.training.sidecar import read_sidecar
 
+# Reward floor for failed explanation extraction.
+# Under -MSE with normalize_activation(_, sqrt_d_model), 0.0 is perfect
+# reconstruction and -2.0 is the expected MSE between orthogonal vectors.
+# Using the orthogonal-equivalent value guarantees a failed extraction can
+# NEVER be advantaged within a GRPO group.
+# See: original NLA reward.py, FAILED_EXTRACTION_REWARD.
+FAILED_EXTRACTION_REWARD = -2.0
+
 
 # ---------------------------------------------------------------------------
 # dataset
@@ -539,7 +547,7 @@ def train(args) -> None:
             for s_idx, resp_text in enumerate(all_responses):
                 explanation = extract_explanation(resp_text)
                 if explanation is None:
-                    rewards.append(-1.0)
+                    rewards.append(FAILED_EXTRACTION_REWARD)
                     continue
                 critic_prompt = critic_template.format(explanation=explanation)
                 critic_prompts.append(critic_prompt)
@@ -571,9 +579,9 @@ def train(args) -> None:
                     if s_idx < len(rewards):
                         rewards[s_idx] = -mse.item()
 
-            # Pad rewards to B*N in case SGLang returned fewer responses than expected
+            # Pad rewards to B*N in case SGLang returned fewer responses than expected.
             while len(rewards) < B * N:
-                rewards.append(-1.0)
+                rewards.append(FAILED_EXTRACTION_REWARD)
             rewards_t = torch.tensor(rewards[:B * N], device=env.device).float()
             reward_history.append(rewards_t.mean().item())
 
