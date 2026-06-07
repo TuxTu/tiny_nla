@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """NLA inference: combined actor (AV → explanation) + critic (explanation → AR vector).
 
+Modes:
+  --text "Your text here"  : extract AV from base model, then full NLA pipeline
+  --av-file vector.npy     : skip extraction, provide AV directly
+  --interactive            : type AV vectors as comma-separated floats
+  (no input)               : demo mode with random AV
+
 Usage:
-  # Default (4B model, demo mode):
-  python scripts/nla_infer.py
+  # Extract AV from text and run full pipeline:
+  python scripts/nla_infer.py --text "The capital of France is"
 
   # Custom model:
   python scripts/nla_infer.py \\
@@ -99,6 +105,86 @@ def load_models(
     print(f"Models loaded. model={model_name}, layers={model_cfg.num_hidden_layers}, "
           f"d_model={d_model}, injection_char={tokens['injection_char']}")
     return actor, critic, tokenizer, tokens, d_model
+
+
+def extract_av(
+    text: str,
+    model_name: str = DEFAULT_MODEL_NAME,
+    layer_index: int | None = None,
+    device: str = "cuda",
+) -> tuple[np.ndarray, int]:
+    """Extract activation vector from a base model at a given layer.
+
+    Runs the text through the base model, hooks into layer ``layer_index``
+    (default: 2/3 of total layers), and captures the hidden state at the
+    last token position.
+
+    Returns
+    -------
+    (av_vector, layer_index) — av_vector is [d_model] float32
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    print(f"Loading base model {model_name} for extraction ...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16,
+        device_map={"": device},
+    )
+    base_model.eval()
+
+    # Resolve layer index
+    if hasattr(base_model, "language_model"):
+        inner = base_model.language_model
+    else:
+        inner = base_model
+    if hasattr(inner, "model"):
+        layers = inner.model.layers
+    elif hasattr(inner, "transformer"):
+        layers = inner.transformer.h
+    else:
+        raise RuntimeError(f"Cannot find decoder layers in {type(base_model).__name__}")
+
+    num_layers = len(layers)
+    if layer_index is None:
+        layer_index = (2 * num_layers) // 3
+    d_model = layers[0].weight.shape[1] if hasattr(layers[0], "weight") else base_model.config.hidden_size
+
+    print(f"  layers={num_layers}  extraction_layer={layer_index}  d_model={d_model}")
+
+    # Hook to capture hidden states
+    captured: torch.Tensor | None = None
+
+    def _hook(_module, _inputs, output):
+        nonlocal captured
+        h = output[0] if isinstance(output, tuple) else output
+        captured = h.detach().clone()
+
+    handle = layers[layer_index].register_forward_hook(_hook)
+
+    # Tokenize and forward
+    enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=2048)
+    input_ids = enc["input_ids"].to(device)
+    attn_mask = enc["attention_mask"].to(device)
+
+    with torch.no_grad():
+        base_model(input_ids=input_ids, attention_mask=attn_mask, use_cache=False)
+
+    handle.remove()
+    assert captured is not None, f"Hook on layer {layer_index} did not fire!"
+
+    # Take hidden state at the last non-padding token
+    seq_len = attn_mask.sum(dim=1).item()
+    av = captured[0, seq_len - 1, :].float().cpu().numpy()  # [d_model]
+
+    # Free base model memory
+    del base_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    print(f"  AV extracted: shape={av.shape}, norm={np.linalg.norm(av):.2f}")
+    return av, layer_index
 
 
 def nla_translate(
@@ -234,11 +320,15 @@ def main():
     p.add_argument("--sidecar", type=str, default=DEFAULT_SIDECAR,
                    help=f"Path to .nla_meta.yaml with injection tokens (default: {DEFAULT_SIDECAR})")
     # ── Input/output ─────────────────────────────────────────────────────
+    p.add_argument("--text", type=str, help="Input text: extract AV from base model, then full NLA")
     p.add_argument("--av-file", type=str, help="Path to .npy file with AV vector [d_model]")
     p.add_argument("--av-json", type=str, help="Path to JSON file with AV vector as list")
     p.add_argument("--output", type=str, help="Save results to JSON file")
     p.add_argument("--interactive", action="store_true",
                    help="Launch interactive mode (type vectors as comma-separated floats)")
+    # ── Extraction params ────────────────────────────────────────────────
+    p.add_argument("--extract-layer", type=int, default=None,
+                   help="Layer for AV extraction (default: 2/3 of total layers)")
     # ── Runtime ──────────────────────────────────────────────────────────
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--max-new-tokens", type=int, default=150)
@@ -270,8 +360,29 @@ def main():
             device=device,
         )
 
+    # ── Text mode: extract AV from base model first ─────────────────────
+    if args.text:
+        av, layer = extract_av(
+            args.text,
+            model_name=args.model_name,
+            layer_index=args.extract_layer,
+            device=device,
+        )
+        print(f"\nInput: \"{args.text}\"")
+        print(f"Extracted AV at layer {layer}, norm={np.linalg.norm(av):.2f}")
+        result = _process(av)
+        print(f"\nExplanation: {result['explanation']}")
+        if result["ar_vector"] is not None:
+            print(f"AR vector norm: {result['ar_vector_norm']:.4f}")
+        if args.output:
+            result["input_text"] = args.text
+            result["extraction_layer"] = layer
+            with open(args.output, "w") as f:
+                json.dump(result, f, indent=2)
+            print(f"Saved to {args.output}")
+
     # ── Batch mode (file input) ──────────────────────────────────────────
-    if args.av_file or args.av_json:
+    elif args.av_file or args.av_json:
         if args.av_file:
             av = np.load(args.av_file)
         else:
