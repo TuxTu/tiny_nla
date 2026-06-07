@@ -2,9 +2,30 @@
 """NLA inference: combined actor (AV → explanation) + critic (explanation → AR vector).
 
 Usage:
-  python scripts/nla_infer.py --av-file vector.npy
-  python scripts/nla_infer.py --av-file vector.npy --output result.json
+  # Default (4B model, demo mode):
+  python scripts/nla_infer.py
+
+  # Custom model:
+  python scripts/nla_infer.py \\
+      --model-name Qwen/Qwen3-4B \\
+      --actor-ckpt checkpoints/actor_sft \\
+      --critic-ckpt checkpoints/critic_sft \\
+      --sidecar data/av_sft_train.parquet.nla_meta.yaml \\
+      --av-file vector.npy
+
+  # 0.6B model:
+  python scripts/nla_infer.py \\
+      --model-name Qwen/Qwen3-0.6B \\
+      --actor-ckpt checkpoints/actor_sft_0.6B \\
+      --critic-ckpt checkpoints/critic_sft_0.6B \\
+      --sidecar data/av_sft_train_0.6B.parquet.nla_meta.yaml \\
+      --interactive
+
+  # Interactive mode:
   python scripts/nla_infer.py --interactive
+
+  # Save results:
+  python scripts/nla_infer.py --av-file vector.npy --output result.json
 """
 
 import argparse
@@ -17,40 +38,66 @@ import torch
 
 PROJ = Path(__file__).resolve().parent.parent
 
+# ── Defaults (4B model) ─────────────────────────────────────────────────
+DEFAULT_MODEL_NAME = "Qwen/Qwen3-4B"
+DEFAULT_ACTOR_CKPT = str(PROJ / "checkpoints/actor_sft")
+DEFAULT_CRITIC_CKPT = str(PROJ / "checkpoints/critic_sft")
+DEFAULT_SIDECAR = str(PROJ / "data/av_sft_train.parquet.nla_meta.yaml")
 
-def load_models(device: str = "cuda"):
-    """Load actor and critic models from SFT checkpoints."""
+
+def load_models(
+    model_name: str = DEFAULT_MODEL_NAME,
+    actor_ckpt: str = DEFAULT_ACTOR_CKPT,
+    critic_ckpt: str = DEFAULT_CRITIC_CKPT,
+    sidecar_path: str = DEFAULT_SIDECAR,
+    device: str = "cuda",
+):
+    """Load actor and critic models from SFT checkpoints.
+
+    Parameters
+    ----------
+    model_name : HF model ID for tokenizer config (e.g. Qwen/Qwen3-4B)
+    actor_ckpt : path to actor SFT checkpoint (saved via save_pretrained)
+    critic_ckpt : path to critic SFT checkpoint (saved via save_pretrained)
+    sidecar_path : path to .nla_meta.yaml with injection token metadata
+    device : "cuda" or "cpu"
+    """
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from nla.training.models import NLACriticModel
     from nla.training.sidecar import read_sidecar
 
-    print(f"Loading actor from {PROJ / 'checkpoints/actor_sft'} ...")
+    print(f"Loading actor from {actor_ckpt} ...")
     actor = AutoModelForCausalLM.from_pretrained(
-        str(PROJ / "checkpoints/actor_sft"),
+        actor_ckpt,
         torch_dtype=torch.bfloat16,
         device_map={"": device},
     )
     actor.eval()
 
-    print(f"Loading critic from {PROJ / 'checkpoints/critic_sft'} ...")
+    print(f"Loading critic from {critic_ckpt} ...")
     critic = NLACriticModel.from_pretrained(
-        str(PROJ / "checkpoints/critic_sft"),
+        critic_ckpt,
         torch_dtype=torch.bfloat16,
     )
     critic = critic.to(device)
     critic.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(str(PROJ / "checkpoints/actor_sft"))
+    # Tokenizer from actor checkpoint (has chat template), fall back to model_name
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(actor_ckpt)
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # Load injection metadata from sidecar
-    sidecar_path = PROJ / "data/av_sft_train.parquet.nla_meta.yaml"
-    sidecar = read_sidecar(str(sidecar_path))
+    sidecar = read_sidecar(sidecar_path)
     tokens = sidecar["tokens"]
     d_model = sidecar["extraction"]["d_model"]
 
-    print(f"Models loaded. d_model={d_model}, injection_char={tokens['injection_char']}")
+    model_cfg = actor.config
+    print(f"Models loaded. model={model_name}, layers={model_cfg.num_hidden_layers}, "
+          f"d_model={d_model}, injection_char={tokens['injection_char']}")
     return actor, critic, tokenizer, tokens, d_model
 
 
@@ -177,11 +224,22 @@ def nla_translate(
 
 def main():
     p = argparse.ArgumentParser(description="NLA inference: AV → explanation → AR")
+    # ── Model config ─────────────────────────────────────────────────────
+    p.add_argument("--model-name", type=str, default=DEFAULT_MODEL_NAME,
+                   help=f"HF model ID for tokenizer (default: {DEFAULT_MODEL_NAME})")
+    p.add_argument("--actor-ckpt", type=str, default=DEFAULT_ACTOR_CKPT,
+                   help=f"Path to actor SFT checkpoint (default: {DEFAULT_ACTOR_CKPT})")
+    p.add_argument("--critic-ckpt", type=str, default=DEFAULT_CRITIC_CKPT,
+                   help=f"Path to critic SFT checkpoint (default: {DEFAULT_CRITIC_CKPT})")
+    p.add_argument("--sidecar", type=str, default=DEFAULT_SIDECAR,
+                   help=f"Path to .nla_meta.yaml with injection tokens (default: {DEFAULT_SIDECAR})")
+    # ── Input/output ─────────────────────────────────────────────────────
     p.add_argument("--av-file", type=str, help="Path to .npy file with AV vector [d_model]")
     p.add_argument("--av-json", type=str, help="Path to JSON file with AV vector as list")
     p.add_argument("--output", type=str, help="Save results to JSON file")
     p.add_argument("--interactive", action="store_true",
                    help="Launch interactive mode (type vectors as comma-separated floats)")
+    # ── Runtime ──────────────────────────────────────────────────────────
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--max-new-tokens", type=int, default=150)
     p.add_argument("--injection-scale", type=float, default=None,
@@ -193,7 +251,13 @@ def main():
         print("CUDA not available, falling back to CPU")
         device = "cpu"
 
-    actor, critic, tokenizer, tokens, d_model = load_models(device)
+    actor, critic, tokenizer, tokens, d_model = load_models(
+        model_name=args.model_name,
+        actor_ckpt=args.actor_ckpt,
+        critic_ckpt=args.critic_ckpt,
+        sidecar_path=args.sidecar,
+        device=device,
+    )
 
     def _process(av: np.ndarray) -> dict:
         if av.shape[-1] != d_model:
