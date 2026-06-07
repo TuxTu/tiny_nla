@@ -307,22 +307,33 @@ def train(args) -> None:
         critic = critic.to(env.device)
     if args.ddp:
         critic = critic.to(env.device)
+
+    # Freeze backbone — only value_head is trained during RL.
+    # Saves ~43 GB GPU memory (gradient buffers + AdamW states for 2.8B params).
+    for p in critic.backbone.parameters():
+        p.requires_grad_(False)
+    critic.value_head.requires_grad_(True)
     critic.train()
 
-    if args.ddp:
-        critic = DDP(critic, device_ids=[env.local_rank] if torch.cuda.is_available() else None,
-                     find_unused_parameters=False)
-
+    # Count trainable params for logging
+    _trainable_critic = sum(p.numel() for p in critic.parameters() if p.requires_grad)
     if env.is_main_process:
-        c = critic.module if args.ddp else critic
-        print(f"critic: {c.config.num_hidden_layers} layers")
+        print(f"critic: {critic.backbone.config.num_hidden_layers} backbone layers "
+              f"(frozen), {_trainable_critic:,} trainable params (value_head only)")
+
+    if args.ddp:
+        # find_unused_parameters=True because backbone is frozen
+        critic = DDP(critic, device_ids=[env.local_rank] if torch.cuda.is_available() else None,
+                     find_unused_parameters=True)
 
     # ---- optimizers (constant LR — no schedule for RL) -----------------------
     actor_optimizer = torch.optim.AdamW(
         actor.parameters(), lr=args.lr_actor,
     )
+    # Only optimize value_head — backbone is frozen
+    _critic_raw = critic.module if args.ddp else critic
     critic_optimizer = torch.optim.AdamW(
-        critic.parameters(), lr=args.lr_critic,
+        _critic_raw.value_head.parameters(), lr=args.lr_critic,
     )
     if env.is_main_process:
         print(f"actor_lr={args.lr_actor}  critic_lr={args.lr_critic}  "
