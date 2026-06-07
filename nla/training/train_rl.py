@@ -642,7 +642,10 @@ def train(args) -> None:
                     if s_idx < len(rewards):
                         rewards[s_idx] = -mse.item()
 
-            rewards_t = torch.tensor(rewards, device=env.device).float()
+            # Pad rewards to B*N in case SGLang returned fewer responses than expected
+            while len(rewards) < B * N:
+                rewards.append(-1.0)
+            rewards_t = torch.tensor(rewards[:B * N], device=env.device).float()
             reward_history.append(rewards_t.mean().item())
 
             # ================================================================
