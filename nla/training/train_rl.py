@@ -643,10 +643,16 @@ def train(args) -> None:
                                     -1, target_ids.unsqueeze(-1)
                                 ).squeeze(-1)
                                 ref_seq_log_prob = ref_token_log_probs.sum()
-                                kl_penalty = seq_log_prob - ref_seq_log_prob
+                                # KL as squared log-ratio: always ≥ 0, pushes
+                                # toward the reference in BOTH directions.
+                                # (seq_log - ref_log)² = (log π_new/π_ref)²
+                                # approximates KL for small deviations but
+                                # never becomes a "KL reward" that accelerates
+                                # divergence when the sign flips.
+                                kl_loss = (seq_log_prob - ref_seq_log_prob) ** 2
 
                         pg_loss = -(advantages[s] * seq_log_prob)
-                        loss = pg_loss + args.kl_coef * kl_penalty
+                        loss = pg_loss + args.kl_coef * kl_loss
                 finally:
                     actor_hook.remove()
 

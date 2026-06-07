@@ -57,7 +57,7 @@ torchrun --nproc_per_node=7 --master_port=29550 \
     --micro-batch-size 1 \
     --lr-actor 1.41e-5 --lr-critic 1.41e-5 \
     --kl-coef 0.01 --max-response-len 256 --max-length 2048 \
-    --num-steps 250 --save-every 100 \
+    --num-steps 250 --save-every 25 \
     --ddp --use-sglang --sglang-external --sglang-gpu-id 0 --sglang-mem-fraction 0.70
 
 kill "$SGLANG_PID" 2>/dev/null || true
