@@ -7,3 +7,5 @@ __pycache__/
 checkpoints/
 data/
 tmp/
+.agents/
+.claude/skills/
