@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""NLA inference: combined actor (AV → explanation) + critic (explanation → AR vector).
+
+Usage:
+  python scripts/nla_infer.py --av-file vector.npy
+  python scripts/nla_infer.py --av-file vector.npy --output result.json
+  python scripts/nla_infer.py --interactive
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+PROJ = Path(__file__).resolve().parent.parent
+
+
+def load_models(device: str = "cuda"):
+    """Load actor and critic models from SFT checkpoints."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from nla.training.models import NLACriticModel
+    from nla.training.sidecar import read_sidecar
+
+    print(f"Loading actor from {PROJ / 'checkpoints/actor_sft'} ...")
+    actor = AutoModelForCausalLM.from_pretrained(
+        str(PROJ / "checkpoints/actor_sft"),
+        torch_dtype=torch.bfloat16,
+        device_map={"": device},
+    )
+    actor.eval()
+
+    print(f"Loading critic from {PROJ / 'checkpoints/critic_sft'} ...")
+    critic = NLACriticModel.from_pretrained(
+        str(PROJ / "checkpoints/critic_sft"),
+        torch_dtype=torch.bfloat16,
+    )
+    critic = critic.to(device)
+    critic.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(str(PROJ / "checkpoints/actor_sft"))
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # Load injection metadata from sidecar
+    sidecar_path = PROJ / "data/av_sft_train.parquet.nla_meta.yaml"
+    sidecar = read_sidecar(str(sidecar_path))
+    tokens = sidecar["tokens"]
+    d_model = sidecar["extraction"]["d_model"]
+
+    print(f"Models loaded. d_model={d_model}, injection_char={tokens['injection_char']}")
+    return actor, critic, tokenizer, tokens, d_model
+
+
+def nla_translate(
+    av_vector: np.ndarray,
+    actor,
+    critic,
+    tokenizer,
+    tokens: dict,
+    d_model: int,
+    injection_scale: float | None = None,
+    max_new_tokens: int = 150,
+    device: str = "cuda",
+) -> dict:
+    """Translate an AV vector through the full NLA pipeline.
+
+    Parameters
+    ----------
+    av_vector : [d_model] float32 numpy array
+
+    Returns
+    -------
+    dict with keys: explanation, ar_vector, actor_text (full generation)
+    """
+    from nla.training.injection import inject_at_marked_positions
+    from nla.training.schema import normalize_activation, extract_explanation
+
+    inj_id = tokens["injection_token_id"]
+    left_id = tokens["injection_left_neighbor_id"]
+    right_id = tokens["injection_right_neighbor_id"]
+    inj_char = tokens["injection_char"]
+
+    vec = torch.from_numpy(av_vector.astype(np.float32)).to(device)
+
+    # Apply injection normalization (same as training: 2.5 * sqrt(d_model))
+    scale = injection_scale if injection_scale is not None else 2.5 * np.sqrt(d_model)
+    vec = normalize_activation(vec.unsqueeze(0), scale).squeeze(0)
+
+    # ── 1. Actor: generate explanation from AV ──────────────────────────
+    prompt = (
+        "You are a meticulous AI researcher conducting an important investigation "
+        "into activation vectors from a language model. Your overall task is to describe "
+        "the semantic content of that activation vector.\n\n"
+        "We will pass the vector enclosed in <concept> tags into your context. You must "
+        "then produce an explanation for the vector, enclosed within <explanation> tags. "
+        "The explanation consists of 2-3 text snippets describing that vector.\n\n"
+        "Here is the vector:\n\n"
+        f"<concept>{inj_char}</concept>\n\n"
+        "Please provide an explanation."
+    )
+
+    prompt_ids = tokenizer(prompt, return_tensors="pt", truncation=True,
+                          max_length=2048)["input_ids"].to(device)
+
+    embed_layer = actor.get_input_embeddings()
+    with torch.no_grad():
+        embeddings = embed_layer(prompt_ids)
+        embeddings = inject_at_marked_positions(
+            prompt_ids, embeddings,
+            vec.unsqueeze(0).to(embeddings.device, embeddings.dtype),
+            inj_id, left_id, right_id,
+        )
+
+        # Register hook for generation
+        def _gen_hook(_vec, _inj_id, _left_id, _right_id):
+            def _hook(_module, args, output):
+                actual_ids = args[0]
+                if output.shape[1] > 1:
+                    return inject_at_marked_positions(
+                        actual_ids, output, _vec.repeat(output.shape[0], 1),
+                        _inj_id, _left_id, _right_id,
+                    )
+                return output
+            return _hook
+
+        hook = embed_layer.register_forward_hook(
+            _gen_hook(vec.unsqueeze(0), inj_id, left_id, right_id)
+        )
+        try:
+            gen_out = actor.generate(
+                prompt_ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=1.0,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+        finally:
+            hook.remove()
+
+    full_text = tokenizer.decode(gen_out[0], skip_special_tokens=True)
+    explanation = extract_explanation(full_text)
+
+    result = {
+        "actor_output": full_text,
+        "explanation": explanation,
+        "ar_vector": None,
+        "ar_vector_norm": None,
+    }
+
+    # ── 2. Critic: predict AR vector from explanation ───────────────────
+    if explanation is not None:
+        critic_prompt = (
+            "You are given a description of an activation vector. Predict the vector.\n\n"
+            f"Description: {explanation}\n\n"
+            "The predicted vector is:"
+        )
+
+        critic_enc = tokenizer(critic_prompt, return_tensors="pt", truncation=True,
+                              max_length=512)
+        c_ids = critic_enc["input_ids"].to(device)
+        c_mask = critic_enc["attention_mask"].to(device)
+
+        with torch.no_grad():
+            c_out = critic(input_ids=c_ids, attention_mask=c_mask)
+            seq_len = c_mask.sum(dim=1) - 1
+            ar_vector = c_out.values[0, seq_len[0], :]  # [d_model]
+
+        result["ar_vector"] = ar_vector.cpu().float().numpy().tolist()
+        result["ar_vector_norm"] = float(ar_vector.norm().item())
+
+    return result
+
+
+def main():
+    p = argparse.ArgumentParser(description="NLA inference: AV → explanation → AR")
+    p.add_argument("--av-file", type=str, help="Path to .npy file with AV vector [d_model]")
+    p.add_argument("--av-json", type=str, help="Path to JSON file with AV vector as list")
+    p.add_argument("--output", type=str, help="Save results to JSON file")
+    p.add_argument("--interactive", action="store_true",
+                   help="Launch interactive mode (type vectors as comma-separated floats)")
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--max-new-tokens", type=int, default=150)
+    p.add_argument("--injection-scale", type=float, default=None,
+                   help="Override injection scale (default: 2.5*sqrt(d_model))")
+    args = p.parse_args()
+
+    device = args.device
+    if device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU")
+        device = "cpu"
+
+    actor, critic, tokenizer, tokens, d_model = load_models(device)
+
+    def _process(av: np.ndarray) -> dict:
+        if av.shape[-1] != d_model:
+            raise ValueError(f"AV vector has dim {av.shape[-1]}, expected {d_model}")
+        return nla_translate(
+            av.reshape(-1)[:d_model],  # flatten and ensure correct size
+            actor, critic, tokenizer, tokens, d_model,
+            injection_scale=args.injection_scale,
+            max_new_tokens=args.max_new_tokens,
+            device=device,
+        )
+
+    # ── Batch mode (file input) ──────────────────────────────────────────
+    if args.av_file or args.av_json:
+        if args.av_file:
+            av = np.load(args.av_file)
+        else:
+            with open(args.av_json) as f:
+                av = np.array(json.load(f), dtype=np.float32)
+        result = _process(av)
+        print(f"\nExplanation: {result['explanation']}")
+        if result["ar_vector"] is not None:
+            print(f"AR vector norm: {result['ar_vector_norm']:.4f}")
+        if args.output:
+            with open(args.output, "w") as f:
+                json.dump(result, f, indent=2)
+            print(f"Saved to {args.output}")
+
+    # ── Interactive mode ─────────────────────────────────────────────────
+    elif args.interactive:
+        print(f"\nNLA Interactive Inference (d_model={d_model})")
+        print("Enter AV vector as comma-separated floats, or 'q' to quit.")
+        print(f"Example: {','.join(['0.1'] * 5)}... (need {d_model} values)\n")
+        while True:
+            try:
+                line = input("AV> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if line.lower() in ("q", "quit", "exit"):
+                break
+            if not line:
+                continue
+            try:
+                values = [float(x.strip()) for x in line.split(",")]
+                if len(values) != d_model:
+                    print(f"  Expected {d_model} values, got {len(values)}")
+                    continue
+                av = np.array(values, dtype=np.float32)
+                result = _process(av)
+                print(f"\n  Actor output:\n  {result['actor_output'][:500]}")
+                print(f"\n  Explanation: {result['explanation']}")
+                if result["ar_vector"] is not None:
+                    print(f"  AR vector norm: {result['ar_vector_norm']:.4f}")
+                print()
+            except ValueError as e:
+                print(f"  Parse error: {e}")
+
+    else:
+        # Default: demo mode with a random AV vector
+        print("\nNo input specified. Running demo with random AV vector...")
+        rng = np.random.RandomState(42)
+        av = rng.randn(d_model).astype(np.float32)
+        result = _process(av)
+        print(f"\nActor output:\n{result['actor_output'][:500]}")
+        print(f"\nExtracted explanation: {result['explanation']}")
+        if result["ar_vector"] is not None:
+            print(f"AR vector norm: {result['ar_vector_norm']:.4f}")
+
+
+if __name__ == "__main__":
+    main()

@@ -470,6 +470,9 @@ def train(args) -> None:
                     all_tokens.append(full_ids)
 
                 del embeds_list
+                # Free cached memory before training to avoid OOM
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             else:
                 # ---- HF generate (default, single-GPU) -----------------------
