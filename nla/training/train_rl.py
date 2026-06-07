@@ -541,20 +541,22 @@ def train(args) -> None:
             # 2. REWARD via critic (batched for efficiency)
             # ================================================================
             _critic = critic.module if args.ddp else critic
-            rewards = []
+            # Pre-allocate ALL rewards at the fallback value (matches original NLA
+            # reward.py: rewards = [FAILED_EXTRACTION_REWARD] * len(samples)).
+            # Valid explanations overwrite their slot; failed/truncated/missing
+            # responses keep the fallback with no gating or padding needed.
+            rewards = [FAILED_EXTRACTION_REWARD] * (B * N)
             critic_prompts = []
             valid_indices = []
             for s_idx, resp_text in enumerate(all_responses):
                 explanation = extract_explanation(resp_text)
                 if explanation is None:
-                    rewards.append(FAILED_EXTRACTION_REWARD)
                     continue
                 critic_prompt = critic_template.format(explanation=explanation)
                 critic_prompts.append(critic_prompt)
                 valid_indices.append(s_idx)
 
             # Batch critic forward for all valid explanations
-            critic_preds = {}
             if critic_prompts:
                 critic_enc = tokenizer(
                     critic_prompts, return_tensors="pt",
@@ -570,19 +572,15 @@ def train(args) -> None:
                 for i, s_idx in enumerate(valid_indices):
                     gold_idx = s_idx // N
                     if gold_idx >= len(vectors):
-                        continue  # safety: scatter may have fewer vectors than expected
+                        continue
                     gold_vec = vectors[gold_idx]
                     mse = F.mse_loss(
                         normalize_activation(preds[i:i+1], mse_scale),
                         normalize_activation(gold_vec.unsqueeze(0), mse_scale),
                     )
-                    if s_idx < len(rewards):
-                        rewards[s_idx] = -mse.item()
+                    rewards[s_idx] = -mse.item()
 
-            # Pad rewards to B*N in case SGLang returned fewer responses than expected.
-            while len(rewards) < B * N:
-                rewards.append(FAILED_EXTRACTION_REWARD)
-            rewards_t = torch.tensor(rewards[:B * N], device=env.device).float()
+            rewards_t = torch.tensor(rewards[: B * N], device=env.device).float()
             reward_history.append(rewards_t.mean().item())
 
             # ================================================================
