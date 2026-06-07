@@ -226,7 +226,7 @@ def nla_translate(
     vec = normalize_activation(vec.unsqueeze(0), scale).squeeze(0)
 
     # ── 1. Actor: generate explanation from AV ──────────────────────────
-    prompt = (
+    user_content = (
         "You are a meticulous AI researcher conducting an important investigation "
         "into activation vectors from a language model. Your overall task is to describe "
         "the semantic content of that activation vector.\n\n"
@@ -236,6 +236,10 @@ def nla_translate(
         "Here is the vector:\n\n"
         f"<concept>{inj_char}</concept>\n\n"
         "Please provide an explanation."
+    )
+    messages = [{"role": "user", "content": user_content}]
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
     )
 
     prompt_ids = tokenizer(prompt, return_tensors="pt", truncation=True,
@@ -374,6 +378,7 @@ def main():
         print(f"\nInput: \"{args.text}\"")
         print(f"Extracted AV at layer {layer}, norm={np.linalg.norm(av):.2f}")
         result = _process(av)
+        print(f"\nRaw actor output:\n{result['actor_output']}")
         print(f"\nExplanation: {result['explanation']}")
         if result["ar_vector"] is not None:
             print(f"AR vector norm: {result['ar_vector_norm']:.4f}")
