@@ -28,5 +28,5 @@ torchrun --nproc_per_node=8 --master_port=29500 \
     --micro-batch-size 1 \
     --lr-actor 1.41e-5 --lr-critic 1.41e-5 \
     --kl-coef 0.01 --max-response-len 150 --max-length 2048 \
-    --num-steps 1000 --save-every 100 --ddp
+    --num-steps 250 --save-every 100 --ddp
 echo "=== RL done ==="
