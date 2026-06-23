@@ -181,15 +181,22 @@ ds = load_dataset("TuHan/qwen3-nla-250k", split="train")
 | Final loss | CE 19.78 | MSE 1.06 |
 | Extraction rate (greedy) | 100% | — |
 
-The SFT actor produces format-correct `<explanation>` output reliably. Example
-(greedy decoding, Qwen3-4B, text *"The capital of France is"*):
+The SFT actor produces format-correct `<explanation>` output but with limited
+semantic accuracy at 0.6B scale. Example from a Qwen3-0.6B SFT model (greedy
+decoding, input text *"if x = 5:\n    print(x)"*):
 
-> `<explanation>` Immediate syntactic expectation: the copula "is" requires a
-> predicate complement — a noun phrase denoting a location, as in "is Paris"
-> or "is a city in Western Europe." Domain knowledge signal: the subject
-> "capital of France" strongly constrains the completion to a specific
-> geographical entity. Register: encyclopedic declarative statement.
+> `<explanation>` Immediate syntactic expectation: the incomplete sentence "and"
+> after "I" requires a parallel structure — likely another clause beginning with
+> a verb. Narrative momentum from list: the sequence has been listing specific
+> features and benefits of the bike, building from the "Why?" question to the
+> product description. Domain-specific register: the text maintains a casual,
+> promotional blog post tone (punchline, bold headings, exclamation points).
 > `</explanation>`
+
+The model learned the `<explanation>` format correctly but the content is
+semantically untethered from the input — it describes a blog post about
+bicycles while the actual text is Python code. At 0.6B scale, the model
+capacity is insufficient for accurate activation-to-text mapping.
 
 **Critic FVE is negative** — the model predicts vectors *worse* than a
 constant mean predictor:
