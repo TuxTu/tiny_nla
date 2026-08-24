@@ -328,8 +328,7 @@ The actor initially appeared completely broken — a real-vs-shuffled gap of
 plausible-sounding explanations were wrong: data volume (a 1k→8k→64k→125k ladder
 showed the gap still climbing at full data), positions-per-doc (Anthropic's
 `qwen7b_ultrafineweb_100k.yaml` uses 10, the same as ours), and injection scale
-(300 vs 160 is a null A/B — layer-0 RMSNorm strips the magnitude before attention
-reads the position).
+(a 300-vs-160 A/B came back null — though see the caveat below).
 
 The actual cause was `sft_loss()` being called **without a loss mask**, averaging
 cross-entropy over prompt + response + padding instead of the response alone.
@@ -349,6 +348,17 @@ Both fixes were required; neither alone sufficed:
 
 The two arms at 300 steps differ *only* in the loss mask (`--legacy-unmasked-loss`
 reproduces the old objective on demand) — a 27× difference from one line.
+
+The injection-scale A/B deserves a caveat: it was run at 150 steps, which we now
+know is too few for the vector channel to exist at all, so it could not have
+detected a scale effect either way. Measured properly on the converged checkpoint,
+scale *does* matter, though moderately — the same checkpoint ablated at its training
+scale of 300 gives **+0.4612**, and at 160 gives **+0.4048**, a 12% loss. (An earlier
+version of this README claimed layer-0 RMSNorm makes scale irrelevant. That is wrong:
+RMSNorm normalizes the *attention* input, but the residual stream adds the raw
+embedding back un-normalized, so magnitude propagates.) `--injection-scale` is
+therefore required rather than defaulted in both `train_actor_sft.py` and
+`train_rl.py`.
 
 **Watch the ablation gap, not the eval CE.** Held-out CE plateaued at ~1.331 from
 step 1000 onward while the ablation gap kept improving; trusting the CE curve would
@@ -409,8 +419,21 @@ retrieval score is 68%.
 - **Tag-extraction regression.** The 8B actor drops `<explanation>` tags on 1.0%
   (greedy) / 2.6% (sampled) of rows; the 4B actor never did. The GRPO reward path
   parses those tags, so this matters for RL.
-- **End-to-end FVE is stale.** The last e2e number (−27.93%) was measured on the
-  pre-fix actor checkpoint and should be re-run before drawing conclusions.
+### End-to-end coupling
+
+Actor generates an explanation from a vector; critic reconstructs the vector from
+that text. 500 held-out rows, `critic_sft_8b_s50` + `actor_sft_8b_s50fix`:
+
+| decoding | FVE_nrm_meannorm | FVE_nrm | MSE | extraction failures |
+|---|---|---|---|---|
+| pre-fix actor (greedy) | −0.2793 | — | 0.8675 | 0% |
+| **greedy** | **+0.5207** | +0.4228 | 0.3250 | 0.2% |
+| **sampled T=1.0** | **+0.4581** | +0.3475 | 0.3675 | 1.0% |
+| *gold explanations (ceiling)* | *+0.6165* | *+0.5382* | *0.2601* | — |
+
+The loop closes: actor-generated text retains 84% (greedy) of what gold
+API-written explanations achieve. GRPO rollouts are *sampled*, so +0.4581 — 74% of
+the ceiling — is the baseline RL actually starts from.
 
 ## License
 

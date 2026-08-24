@@ -203,8 +203,17 @@ def train(args) -> None:
     injection_scale = resolve_target_scale(
         sidecar.get("extraction", {}).get("injection_scale"), d_model,
     )
+    if args.injection_scale is not None:
+        injection_scale = resolve_target_scale(args.injection_scale, d_model)
     if injection_scale is None:
-        injection_scale = 2.5 * math.sqrt(d_model)
+        # MUST match the scale the actor checkpoint was SFT'd at. The old
+        # 2.5*sqrt(d_model) fallback silently gives 160 while actor_sft_8b_s50fix
+        # was trained at 300 -- a train/inference mismatch that degrades every
+        # rollout and therefore every reward, with nothing in the log to show it.
+        raise SystemExit(
+            "injection_scale is required: pass --injection-scale to match the "
+            "actor checkpoint's SFT scale (RL sidecars carry injection_scale: null)."
+        )
     if env.is_main_process:
         print(f"mse_scale={mse_scale}  injection_scale={injection_scale}")
 
@@ -1027,6 +1036,9 @@ def main() -> None:
     p.add_argument("--micro-batch-size", type=int, default=1)
     p.add_argument("--lr-actor", type=float, default=1.41e-5)
     p.add_argument("--lr-critic", type=float, default=1.41e-5)
+    p.add_argument("--injection-scale", type=str, default=None,
+                   help="L2 norm for injected vectors. MUST match the actor "
+                        "checkpoint's SFT scale (e.g. 300 for actor_sft_8b_s50fix).")
     p.add_argument("--kl-coef", type=float, default=0.01,
                    help="KL penalty coefficient (0=disabled)")
     p.add_argument("--kl-type", type=str, default="per_seq",
