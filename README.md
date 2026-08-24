@@ -328,7 +328,9 @@ The actor initially appeared completely broken — a real-vs-shuffled gap of
 plausible-sounding explanations were wrong: data volume (a 1k→8k→64k→125k ladder
 showed the gap still climbing at full data), positions-per-doc (Anthropic's
 `qwen7b_ultrafineweb_100k.yaml` uses 10, the same as ours), and injection scale
-(a 300-vs-160 A/B came back null — though see the caveat below).
+(a 300-vs-160 A/B came back null — but that A/B ran for only 150 steps, too few
+for the vector channel to exist at all, so it could not have detected a scale
+effect; see *Injection scale* below for the corrected measurement).
 
 The actual cause was `sft_loss()` being called **without a loss mask**, averaging
 cross-entropy over prompt + response + padding instead of the response alone.
@@ -364,6 +366,27 @@ therefore required rather than defaulted in both `train_actor_sft.py` and
 step 1000 onward while the ablation gap kept improving; trusting the CE curve would
 have stopped training three checkpoints early. This matches the reference
 implementation's own note: *"real-vs-rand gap is the signal, not train loss."*
+
+### Injection scale
+
+Measured on the same checkpoint (`actor_sft_8b_s50fix`, 256 held-out rows), varying
+only the L2 norm the activation vector is rescaled to before replacing the marker
+token's embedding:
+
+| injection scale | real-vs-shuffled gap |
+|---|---|
+| **300** (matches SFT) | **+0.4612** |
+| 160 | +0.4048 |
+
+A ~2x scale error costs about **12%** of the conditioning signal — a real effect,
+but not a dominant one. An earlier claim that layer-0 RMSNorm makes scale
+irrelevant was wrong: RMSNorm normalises the *attention* input, but the residual
+stream adds the raw embedding back un-normalised, so magnitude does propagate.
+
+This matters because RL sidecars carry `injection_scale: null`, and the old
+`2.5 * sqrt(d_model)` fallback silently produced 160 while the actor was SFT'd at
+300. Both `train_actor_sft.py` and `train_rl.py` now **require** `--injection-scale`
+rather than defaulting.
 
 ### Generated explanations
 
