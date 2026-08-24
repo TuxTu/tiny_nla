@@ -281,7 +281,13 @@ def nla_translate(
         finally:
             hook.remove()
 
-    full_text = tokenizer.decode(gen_out[0], skip_special_tokens=True)
+    # Decode ONLY the generated continuation. Decoding the full sequence lets
+    # extract_explanation match the literal "<explanation>" that appears in the
+    # PROMPT ("...enclosed within <explanation> tags."), so every "explanation"
+    # came back as ~60 tokens of instruction boilerplate glued to the real one --
+    # and that boilerplate is what the critic scored.
+    gen_ids = gen_out[0][prompt_ids.shape[1]:]
+    full_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
     explanation = extract_explanation(full_text)
 
     result = {

@@ -110,14 +110,9 @@ def main() -> None:
           f"specials={len(tokenizer.all_special_ids)})")
 
     special_ids = set(tokenizer.all_special_ids)
-    pad_id_to_check = (
-        tokenizer.pad_token_id
-        if (
-            tokenizer.pad_token_id is not None
-            and tokenizer.pad_token_id != tokenizer.eos_token_id
-        )
-        else None
-    )
+    # Disable pad-token collision check — Qwen family uses <|endoftext|>
+    # (eos_token_id) as pad_token_id, and this token naturally occurs in
+    # real text (it's a valid byte-level BPE token, not just a special).
 
     # Streaming: lists shard URLs (fast, no footer scan), opens shards
     # sequentially, .skip() reads through earlier docs, .take() stops after
@@ -170,11 +165,6 @@ def main() -> None:
                         truncation=True,
                         max_length=args.max_length,
                     )["input_ids"]
-
-                    if pad_id_to_check is not None:
-                        assert pad_id_to_check not in token_ids, (
-                            f"pad_token_id {pad_id_to_check} found in token_ids for {doc_id}"
-                        )
 
                     positions = _sample_positions(
                         token_ids,

@@ -162,8 +162,10 @@ def _truncate_to_cross_rank_min(tokens_list: list, env) -> int:
 def train(args) -> None:
     env = detect()
 
-    # ---- DDP setup -----------------------------------------------------------
-    if args.ddp and env.world_size > 1:
+    # ---- DDP / FSDP setup ----------------------------------------------------
+    use_fsdp = getattr(args, "fsdp", False)
+    use_dist = args.ddp or use_fsdp
+    if use_dist and env.world_size > 1:
         dist.init_process_group(backend="nccl")
         print(f"[rank {env.global_rank}/{env.world_size}] "
               f"device={env.device}  gpu={env.gpu_name}")
@@ -172,9 +174,13 @@ def train(args) -> None:
         print("[ddp] WARNING: --ddp passed but WORLD_SIZE=1 — running single-GPU")
         args.ddp = False
 
+    # fp32 master weights; FSDP MixedPrecision casts to bf16 for compute only.
+    # bf16 masters silently drop optimizer steps below half a bf16 ulp (at |w|~0.02
+    # the ulp is 6.1e-5 vs an AdamW step of ~lr=2e-5) -> backbone never moves.
+    param_dtype = getattr(torch, getattr(args, "param_dtype", "float32"))
     if env.is_main_process:
         print(f"device: {env.device}  dtype: {env.dtype}  "
-              f"ddp: {args.ddp}  world_size: {env.world_size}")
+              f"ddp: {args.ddp}  fsdp: {use_fsdp}  world_size: {env.world_size}")
 
     # ---- resolve data path ---------------------------------------------------
     from nla.training.resolve import resolve_parquet
@@ -228,14 +234,17 @@ def train(args) -> None:
         prompts, vectors = zip(*batch)
         return list(prompts), torch.stack(vectors)
 
-    # In DDP mode: use DistributedSampler so each rank gets different prompts
+    # Each rank must get DIFFERENT prompts. Keyed on use_dist, not args.ddp:
+    # under --fsdp alone every rank rolled out the SAME prompts, which collapses
+    # the effective batch to 1/world_size and correlates the GRPO advantages.
+    dist_sampler = use_dist and env.world_size > 1
     sampler = DistributedSampler(ds, num_replicas=env.world_size,
                                   rank=env.global_rank,
-                                  shuffle=True) if args.ddp else None
+                                  shuffle=True) if dist_sampler else None
     dl = DataLoader(ds, batch_size=effective_rollout_batch,
                     shuffle=(sampler is None),
                     sampler=sampler,
-                    drop_last=args.ddp,
+                    drop_last=dist_sampler,
                     collate_fn=_collate)
 
     # ---- actor model ---------------------------------------------------------
@@ -254,24 +263,51 @@ def train(args) -> None:
         if env.is_main_process:
             print(f"loading actor from {actor_ckpt} ...")
     actor = AutoModelForCausalLM.from_pretrained(
-        actor_ckpt, torch_dtype=env.dtype,
-        device_map={"": env.device} if not args.ddp else None,
+        actor_ckpt, torch_dtype=param_dtype,
+        device_map={"": env.device} if not (args.ddp and not use_fsdp) else None,
     )
     if env.is_mps:
         actor = actor.to(env.device)
-    if args.ddp:
+    if use_dist:
         actor = actor.to(env.device)
     actor.train()
     if hasattr(actor, "gradient_checkpointing_enable"):
         actor.gradient_checkpointing_enable()
 
-    if args.ddp:
+    if use_fsdp:
+        from functools import partial
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            ShardingStrategy,
+            MixedPrecision,
+        )
+        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+
+        auto_wrap = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={Qwen3DecoderLayer},
+        )
+        mixed_precision = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            buffer_dtype=torch.float32,
+        )
+        actor = FSDP(
+            actor,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            auto_wrap_policy=auto_wrap,
+            mixed_precision=mixed_precision,
+            device_id=env.local_rank if torch.cuda.is_available() else None,
+        )
+    elif args.ddp:
         actor = DDP(actor, device_ids=[env.local_rank] if torch.cuda.is_available() else None,
                     find_unused_parameters=False)
 
     if env.is_main_process:
-        a = actor.module if args.ddp else actor
-        print(f"actor: {a.config.num_hidden_layers} layers")
+        a = actor.module if use_dist else actor
+        print(f"actor: {a.config.num_hidden_layers} layers  "
+              f"sharding={'FSDP' if use_fsdp else 'DDP' if args.ddp else 'none'}")
 
     # ---- reference model (frozen, for KL) ------------------------------------
     ref_model = None
@@ -280,8 +316,8 @@ def train(args) -> None:
         if env.is_main_process:
             print(f"loading reference model from {args.actor_ckpt} ...")
         ref_model = AutoModelForCausalLM.from_pretrained(
-            args.actor_ckpt, torch_dtype=env.dtype,
-            device_map={"": env.device} if not args.ddp else None,
+            args.actor_ckpt, torch_dtype=torch.bfloat16,  # frozen, inference only
+            device_map={"": env.device} if not (args.ddp and not use_fsdp) else None,
         )
         if env.is_mps:
             ref_model = ref_model.to(env.device)
@@ -308,12 +344,12 @@ def train(args) -> None:
             print(f"loading critic from {critic_ckpt} ...")
     critic = NLACriticModel.from_pretrained(
         critic_ckpt,
-        torch_dtype=env.dtype,
-        device_map={"": env.device} if not args.ddp else None,
+        torch_dtype=param_dtype,
+        device_map={"": env.device} if not (args.ddp and not use_fsdp) else None,
     )
     if env.is_mps:
         critic = critic.to(env.device)
-    if args.ddp:
+    if use_dist:
         critic = critic.to(env.device)
 
     if args.freeze_critic:
@@ -325,17 +361,54 @@ def train(args) -> None:
     else:
         critic.train()
 
-    if args.ddp and not args.freeze_critic:
+    if use_fsdp and not args.freeze_critic:
+        from functools import partial
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            ShardingStrategy,
+            MixedPrecision,
+        )
+        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+
+        auto_wrap = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={Qwen3DecoderLayer},
+        )
+        mixed_precision = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            buffer_dtype=torch.float32,
+        )
+        critic = FSDP(
+            critic,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            auto_wrap_policy=auto_wrap,
+            mixed_precision=mixed_precision,
+            device_id=env.local_rank if torch.cuda.is_available() else None,
+        )
+    elif args.ddp and not args.freeze_critic:
         critic = DDP(critic, device_ids=[env.local_rank] if torch.cuda.is_available() else None,
                      find_unused_parameters=False)
 
     if env.is_main_process:
-        c = (critic.module if args.ddp and not args.freeze_critic else critic)
-        print(f"critic: {c.config.num_hidden_layers} layers")
+        c = (critic.module if use_dist and not args.freeze_critic else critic)
+        print(f"critic: {c.config.num_hidden_layers} layers  "
+              f"sharding={'FSDP' if use_fsdp else 'DDP' if args.ddp else 'none'}")
 
-    # ---- optimizers (ZeroRedundancyOptimizer shards states across ranks) ----
-    # Each rank stores 1/world_size of AdamW states → saves ~46 GB per GPU
-    if args.ddp and env.world_size > 1:
+    # ---- optimizers -----------------------------------------------------------
+    # FSDP (FULL_SHARD) shards params, grads, AND optimizer states automatically.
+    # DDP uses ZeroRedundancyOptimizer to shard optimizer states across ranks.
+    # Single-GPU: plain AdamW (fits in 80 GB for 8B models individually, but
+    # not with both actor and critic simultaneously — use FSDP for 8B+).
+    if use_fsdp:
+        # FSDP already shards everything — plain AdamW is fine.
+        actor_optimizer = torch.optim.AdamW(actor.parameters(), lr=args.lr_actor)
+        if not args.freeze_critic:
+            critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=args.lr_critic)
+        else:
+            critic_optimizer = None
+    elif args.ddp and env.world_size > 1:
         from torch.distributed.optim import ZeroRedundancyOptimizer
         actor_optimizer = ZeroRedundancyOptimizer(
             actor.parameters(),
@@ -365,6 +438,48 @@ def train(args) -> None:
               f"kl_coef={args.kl_coef}  n_samples={args.n_samples}  "
               f"lr_decay=constant")
 
+    # After model/optimizer setup, unify args.ddp for downstream code.
+    # All .module access, dist.barrier, DistributedSampler logic works the same
+    # for FSDP and DDP. Optimizer and model-wrapping code above this point
+    # already handle the distinction.
+    args.ddp = use_dist
+
+    # FSDP helper: gather full state dict (collective — all ranks must enter).
+    def _fsdp_full_sd(model):
+        """Return (full_state_dict, state_dict_type_ctx).
+
+        For FSDP: returns FULL_STATE_DICT gathered to CPU on rank 0.
+        Caller MUST enter the context manager before calling model.state_dict().
+        """
+        if not use_fsdp:
+            return None, None
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        return FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg), cfg
+
+    def _save_model(model, save_dir, tokenizer, *, subdir: str = None):
+        """Save an FSDP/DDP model with full state dict gathering."""
+        target = Path(save_dir)
+        if subdir:
+            target = target / subdir
+        if use_fsdp:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
+                full_sd = model.state_dict()
+            if env.is_main_process:
+                model.module.save_pretrained(str(target), state_dict=full_sd)
+        else:
+            if env.is_main_process:
+                m = model.module if args.ddp else model
+                m.save_pretrained(str(target))
+        if env.is_main_process and tokenizer is not None:
+            tokenizer.save_pretrained(str(target))
+        if env.is_main_process:
+            print(f"  checkpoint saved → {target}")
+
     # ---- SGLang rollout server (launched on dedicated GPU if specified) ------
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     actor_save = Path(args.output_dir) / "actor"
@@ -379,11 +494,8 @@ def train(args) -> None:
 
         sglang_gpu = getattr(args, "sglang_gpu_id", None)
 
-        # Initial save so SGLang has weights to load (rank 0 only)
-        if env.is_main_process:
-            _actor_save = actor.module if args.ddp else actor
-            _actor_save.save_pretrained(str(actor_save))
-            tokenizer.save_pretrained(str(actor_save))
+        # Initial save so SGLang has weights to load
+        _save_model(actor, str(args.output_dir), tokenizer, subdir="actor")
 
         # ALL ranks create a rollout object — each rank calls SGLang
         # independently for per-rank generation (no cross-rank gather needed).
@@ -413,14 +525,11 @@ def train(args) -> None:
     reward_history = []
 
     def _save():
-        if not env.is_main_process:
-            return
-        _actor_save = actor.module if args.ddp else actor
-        _critic_save = (critic.module if args.ddp and not args.freeze_critic else critic)
-        _actor_save.save_pretrained(str(actor_save))
-        _critic_save.save_pretrained(str(critic_save))
-        tokenizer.save_pretrained(str(actor_save))
-        print(f"  checkpoint saved → {args.output_dir}  (step {global_step})")
+        _save_model(actor, str(args.output_dir), tokenizer, subdir="actor")
+        if not args.freeze_critic:
+            _save_model(critic, str(args.output_dir), None, subdir="critic")
+        if env.is_main_process:
+            print(f"  checkpoint saved → {args.output_dir}  (step {global_step})")
 
     while global_step < args.num_steps:
         if sampler is not None:
@@ -451,7 +560,7 @@ def train(args) -> None:
             # Vectors are already normalized at line 397.
             if rollout is not None:
                 # ---- SGLang rollout (per-rank, no cross-rank comm) -------------
-                embed_layer = (actor.module if args.ddp else actor).get_input_embeddings()
+                embed_layer = (actor.module if (args.ddp and not use_fsdp) else actor).get_input_embeddings()
                 embeds_list = []
                 for i, (msgs, vec) in enumerate(zip(messages_batch, vectors)):
                     for _ in range(N):
@@ -497,63 +606,157 @@ def train(args) -> None:
 
             else:
                 # ---- HF generate (default, single-GPU) -----------------------
-                _actor = actor.module if args.ddp else actor
-                _actor.eval()
+                # FSDP: gather full weights → standalone model on rank 0 →
+                #   generate → broadcast results → discard standalone.
+                #   .generate() is fundamentally incompatible with FSDP's
+                #   parameter sharding; summon_full_params also breaks due
+                #   to gradient-checkpointing / KV-cache state conflicts.
+                # DDP: unwrap .module and generate directly.
+                actor.eval()
                 all_responses = []
                 all_tokens = []
-                with torch.no_grad():
-                    for i, prompt_text in enumerate(prompt_texts):
-                        prompt_enc = tokenizer(
-                            prompt_text, return_tensors="pt",
-                            truncation=True, max_length=args.max_length,
-                        )
-                        prompt_ids = prompt_enc["input_ids"].to(env.device)
-                        vec = vectors[i:i+1]
 
-                        def _make_gen_hook(_vec, _inj_id, _left_id, _right_id):
-                            def _hook(module, args, output):
-                                actual_ids = args[0]
-                                if output.shape[1] > 1:
-                                    return inject_at_marked_positions(
-                                        actual_ids, output, _vec.repeat(output.shape[0], 1),
-                                        _inj_id, _left_id, _right_id,
+                if use_fsdp and env.world_size > 1:
+                    # ---- FSDP path: gather → standalone → broadcast ----------
+                    from torch.distributed.fsdp import (
+                        FullyShardedDataParallel as FSDP,
+                        FullStateDictConfig,
+                        StateDictType,
+                    )
+                    # 1. Gather full state dict (all ranks must enter this ctx)
+                    cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                    with FSDP.state_dict_type(actor, StateDictType.FULL_STATE_DICT, cfg):
+                        full_sd = actor.state_dict()
+
+                    gen_responses = None  # list of (resp_text, token_ids) on rank 0
+
+                    if env.is_main_process:
+                        # 2. Load into a standalone model (no FSDP) for clean .generate()
+                        gen_model = AutoModelForCausalLM.from_pretrained(
+                            args.actor_ckpt, torch_dtype=torch.bfloat16,  # rollout only
+                            device_map={"": env.device},
+                        )
+                        gen_model.load_state_dict(full_sd, strict=False)
+                        gen_model.eval()
+                        del full_sd
+
+                        # 3. Generate — standard HF .generate(), no FSDP overhead
+                        gen_model_embed = gen_model.get_input_embeddings()
+                        _gen_responses = []
+                        with torch.no_grad():
+                            for i, prompt_text in enumerate(prompt_texts):
+                                prompt_enc = tokenizer(
+                                    prompt_text, return_tensors="pt",
+                                    truncation=True, max_length=args.max_length,
+                                )
+                                prompt_ids = prompt_enc["input_ids"].to(env.device)
+                                vec = vectors[i:i+1]
+
+                                def _make_gen_hook(_vec, _inj_id, _left_id, _right_id):
+                                    def _hook(_module, _args, output):
+                                        actual_ids = _args[0]
+                                        if output.shape[1] > 1:
+                                            return inject_at_marked_positions(
+                                                actual_ids, output,
+                                                _vec.repeat(output.shape[0], 1),
+                                                _inj_id, _left_id, _right_id,
+                                            )
+                                        return output
+                                    return _hook
+
+                                hook = gen_model_embed.register_forward_hook(
+                                    _make_gen_hook(vec, inj_id, left_id, right_id)
+                                )
+                                try:
+                                    gen_out = gen_model.generate(
+                                        prompt_ids,
+                                        max_new_tokens=args.max_response_len,
+                                        do_sample=True,
+                                        temperature=1.0,
+                                        num_return_sequences=N,
+                                        pad_token_id=tokenizer.pad_token_id,
+                                        eos_token_id=tokenizer.eos_token_id,
                                     )
-                                return output
-                            return _hook
+                                finally:
+                                    hook.remove()
 
+                                for s in range(N):
+                                    seq = gen_out[s]
+                                    resp_ids = seq[prompt_ids.shape[1]:]
+                                    resp_text = tokenizer.decode(resp_ids, skip_special_tokens=True)
+                                    _gen_responses.append((resp_text, seq.cpu()))
+
+                        gen_responses = _gen_responses
+                        del gen_model
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                    # 4. Broadcast results to all ranks
+                    gen_responses = _broadcast_object(gen_responses, env, src=0)
+                    for resp_text, seq in gen_responses:
+                        all_responses.append(resp_text)
+                        all_tokens.append(seq.to(env.device))
+
+                else:
+                    # ---- Non-FSDP path: generate directly --------------------
+                    _actor = actor.module if args.ddp else actor
+                    if args.ddp:
+                        _actor.gradient_checkpointing_disable()
+                    try:
                         embed = _actor.get_input_embeddings()
-                        hook = embed.register_forward_hook(
-                            _make_gen_hook(vec, inj_id, left_id, right_id)
-                        )
+                        with torch.no_grad():
+                            for i, prompt_text in enumerate(prompt_texts):
+                                prompt_enc = tokenizer(
+                                    prompt_text, return_tensors="pt",
+                                    truncation=True, max_length=args.max_length,
+                                )
+                                prompt_ids = prompt_enc["input_ids"].to(env.device)
+                                vec = vectors[i:i+1]
 
-                        try:
-                            gen_out = _actor.generate(
-                                prompt_ids,
-                                max_new_tokens=args.max_response_len,
-                                do_sample=True,
-                                temperature=1.0,
-                                num_return_sequences=N,
-                                pad_token_id=tokenizer.pad_token_id,
-                                eos_token_id=tokenizer.eos_token_id,
-                            )
-                        finally:
-                            hook.remove()
+                                def _make_gen_hook(_vec, _inj_id, _left_id, _right_id):
+                                    def _hook(_module, _args, output):
+                                        actual_ids = _args[0]
+                                        if output.shape[1] > 1:
+                                            return inject_at_marked_positions(
+                                                actual_ids, output,
+                                                _vec.repeat(output.shape[0], 1),
+                                                _inj_id, _left_id, _right_id,
+                                            )
+                                        return output
+                                    return _hook
 
-                        for s in range(N):
-                            seq = gen_out[s]
-                            resp_ids = seq[prompt_ids.shape[1]:]
-                            resp_text = tokenizer.decode(resp_ids, skip_special_tokens=True)
-                            all_responses.append(resp_text)
-                            all_tokens.append(seq)
+                                hook = embed.register_forward_hook(
+                                    _make_gen_hook(vec, inj_id, left_id, right_id)
+                                )
+                                try:
+                                    gen_out = _actor.generate(
+                                        prompt_ids,
+                                        max_new_tokens=args.max_response_len,
+                                        do_sample=True,
+                                        temperature=1.0,
+                                        num_return_sequences=N,
+                                        pad_token_id=tokenizer.pad_token_id,
+                                        eos_token_id=tokenizer.eos_token_id,
+                                    )
+                                finally:
+                                    hook.remove()
 
-                _actor.train()
+                                for s in range(N):
+                                    seq = gen_out[s]
+                                    resp_ids = seq[prompt_ids.shape[1]:]
+                                    resp_text = tokenizer.decode(resp_ids, skip_special_tokens=True)
+                                    all_responses.append(resp_text)
+                                    all_tokens.append(seq)
+                    finally:
+                        if args.ddp:
+                            _actor.gradient_checkpointing_enable()
 
             actor.train()  # ensure training mode after generation
 
             # ================================================================
             # 2. REWARD via critic (batched for efficiency)
             # ================================================================
-            _critic = (critic.module if args.ddp and not args.freeze_critic else critic)
+            _critic = (critic.module if (args.ddp and not use_fsdp and not args.freeze_critic) else critic)
             # Pre-allocate ALL rewards at the fallback value (matches original NLA
             # reward.py: rewards = [FAILED_EXTRACTION_REWARD] * len(samples)).
             # Valid explanations overwrite their slot; failed/truncated/missing
@@ -593,6 +796,8 @@ def train(args) -> None:
                     )
                     rewards[s_idx] = -mse.item()
 
+            n_extract_fail = (B * N) - len(valid_indices)
+
             rewards_t = torch.tensor(rewards[: B * N], device=env.device).float()
             reward_history.append(rewards_t.mean().item())
 
@@ -607,7 +812,8 @@ def train(args) -> None:
             # ================================================================
             # 4. ACTOR UPDATE (policy gradient + optional KL)
             # ================================================================
-            _actor = actor.module if args.ddp else actor
+            # FSDP: keep wrapper so forward all-gathers params. DDP: unwrap (.module).
+            _actor = actor.module if (args.ddp and not use_fsdp) else actor
             actor_embed = _actor.get_input_embeddings()
 
             actor_loss_sum = 0.0
@@ -640,7 +846,7 @@ def train(args) -> None:
                         token_log_probs = log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
                         seq_log_prob = token_log_probs.sum()
 
-                        kl_penalty = torch.tensor(0.0, device=env.device)
+                        kl_loss = torch.tensor(0.0, device=env.device)
                         if ref_model is not None:
                             with torch.no_grad():
                                 ref_hook = ref_embed.register_forward_hook(
@@ -673,17 +879,18 @@ def train(args) -> None:
 
                 loss.backward()
                 actor_loss_sum += loss.detach().item()
+                torch.cuda.empty_cache()  # free cached allocator memory between samples
 
             # Average gradients across DDP ranks (handled by DDP automatically)
             actor_optimizer.step()
+            actor_optimizer.zero_grad(set_to_none=True)  # free actor grads before critic backward
             actor_losses.append(actor_loss_sum / (B * N))
 
             # ---- sync updated weights to SGLang for next step ----------
-            if rollout is not None and env.is_main_process:
-                _actor_save = actor.module if args.ddp else actor
-                _actor_save.save_pretrained(str(actor_save))
-                tokenizer.save_pretrained(str(actor_save))
-                rollout.update_weights(str(actor_save))
+            if rollout is not None:
+                _save_model(actor, str(args.output_dir), tokenizer, subdir="actor")
+                if env.is_main_process:
+                    rollout.update_weights(str(actor_save))
 
             # Barrier: ensure weight sync finishes before next generation
             if args.ddp and rollout is not None:
@@ -732,7 +939,7 @@ def train(args) -> None:
 
                     with torch.autocast(device_type=env.device.type, dtype=env.dtype,
                                         enabled=env.amp_enabled):
-                        _critic_fwd = (critic.module if args.ddp and not args.freeze_critic else critic)
+                        _critic_fwd = (critic.module if (args.ddp and not use_fsdp and not args.freeze_critic) else critic)
                         c_out = _critic_fwd(input_ids=c_ids_batch, attention_mask=c_mask_batch)
                         seq_lens = c_mask_batch.sum(dim=1) - 1
                         pred = c_out.values[torch.arange(len(seq_lens)), seq_lens]
@@ -757,6 +964,16 @@ def train(args) -> None:
                     critic_loss=f"{critic_losses[-1]:.4f}",
                     reward=f"{reward_history[-1]:.4f}",
                 )
+                valid_r = rewards_t[rewards_t > FAILED_EXTRACTION_REWARD]
+                print(
+                    f"[rl] step={global_step} "
+                    f"reward={reward_history[-1]:+.4f} "
+                    f"reward_valid={valid_r.mean().item() if valid_r.numel() else float('nan'):+.4f} "
+                    f"extract_fail={n_extract_fail}/{B * N} "
+                    f"adv_absmean={advantages.abs().mean().item():.4f} "
+                    f"actor_loss={actor_losses[-1]:.4f} critic_loss={critic_losses[-1]:.4f}",
+                    flush=True,
+                )
 
             global_step += 1
 
@@ -780,9 +997,11 @@ def train(args) -> None:
             print(f"\nactor_loss: {actor_losses[-1]:.4f}  "
                   f"critic_loss: {critic_losses[-1]:.4f}  "
                   f"reward: {reward_history[-1]:.4f}")
-        _save()
+    # NOT inside is_main_process: FSDP's FULL_STATE_DICT gather is a COLLECTIVE.
+    # _save() writes on rank 0 only, internally.
+    _save()
 
-    if args.ddp:
+    if use_dist and env.world_size > 1:
         dist.destroy_process_group()
 
 
@@ -832,6 +1051,11 @@ def main() -> None:
                    help="dedicated GPU ID for SGLang (when DDP uses other GPUs)")
     p.add_argument("--ddp", action="store_true",
                    help="enable DistributedDataParallel (use with torchrun)")
+    p.add_argument("--param-dtype", default="float32",
+                   choices=["float32", "bfloat16"],
+                   help="master weight dtype (float32 = fp32 masters + bf16 compute)")
+    p.add_argument("--fsdp", action="store_true",
+                   help="enable FullyShardedDataParallel / ZeRO-3 (use with torchrun)")
     args = p.parse_args()
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))

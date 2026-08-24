@@ -294,6 +294,124 @@ signal is too noisy to improve explanation quality.
 - **RL infrastructure:** SGLang rollout, GRPO, ZeroRedundancyOptimizer,
   DDP with DistributedSampler, checkpoint snapshots — all working.
 
+## Qwen3-8B results
+
+Scaling the pipeline to Qwen3-8B (36 layers, d_model=4096, extraction layer 24)
+on 100k UltraFineWeb documents. Both models train on **document-disjoint** halves
+of the labeled pool, so no document seen by the critic is seen by the actor.
+
+| Setting | Value |
+|---------|-------|
+| Base model | Qwen3-8B (36 layers, d_model=4096) |
+| Critic | 25 layers (2/3 truncated) + value_head, identity-init |
+| Injection | char `㈎`, scale 300 (mean vector L2 = 266) |
+| AV pool | 124,741 pairs / 12,500 docs (10 positions per doc) |
+| Actor SFT | 1,461 steps (3 epochs), global_batch=256, 4×A100 FSDP, fp32 master weights |
+| Critic SFT | 487 steps (1 epoch), global_batch=256, 4×A100 |
+
+| Metric | Actor (AV) | Critic (AR) |
+|--------|-----------|------------|
+| Final held-out CE | 1.3305 | — |
+| Final held-out MSE | — | 0.2405 |
+| **FVE_nrm_meannorm** | — | **+62.93%** |
+| **FVE_nrm** | — | **+55.75%** |
+| **Real-vs-shuffled gap** | **+0.4593** | — |
+
+Both directions work at 8B. The critic beats the mean predictor by a wide margin
+(the 4B critic could not, see above), and the actor genuinely conditions on the
+injected vector.
+
+### The loss mask is not optional
+
+The actor initially appeared completely broken — a real-vs-shuffled gap of
+**+0.0013**, i.e. swapping in a *different* vector cost the model nothing. Three
+plausible-sounding explanations were wrong: data volume (a 1k→8k→64k→125k ladder
+showed the gap still climbing at full data), positions-per-doc (Anthropic's
+`qwen7b_ultrafineweb_100k.yaml` uses 10, the same as ours), and injection scale
+(300 vs 160 is a null A/B — layer-0 RMSNorm strips the magnitude before attention
+reads the position).
+
+The actual cause was `sft_loss()` being called **without a loss mask**, averaging
+cross-entropy over prompt + response + padding instead of the response alone.
+Padding was not even marked `-100`, so `pad == eos` was scored as a real target.
+This halved the reported CE, which made the loss curve look converged when it was
+not — so every run was also stopped far too early.
+
+Both fixes were required; neither alone sufficed:
+
+| loss | steps | real-vs-shuffled gap |
+|------|-------|---------------------|
+| unmasked | 487 | +0.0013 |
+| unmasked | 300 | +0.0054 |
+| masked | 150 | +0.0027 |
+| masked | 300 | +0.1462 |
+| **masked** | **1,461** | **+0.4593** |
+
+The two arms at 300 steps differ *only* in the loss mask (`--legacy-unmasked-loss`
+reproduces the old objective on demand) — a 27× difference from one line.
+
+**Watch the ablation gap, not the eval CE.** Held-out CE plateaued at ~1.331 from
+step 1000 onward while the ablation gap kept improving; trusting the CE curve would
+have stopped training three checkpoints early. This matches the reference
+implementation's own note: *"real-vs-rand gap is the signal, not train loss."*
+
+### Generated explanations
+
+`scripts/actor_vector_ablation.py` proves the vector carries information; it says
+nothing about whether the text is any good. `scripts/actor_gen_inspect.py` checks
+the output directly on 500 held-out rows:
+
+| | 4B actor (greedy) | 8B actor (greedy) | 8B actor (sampled) |
+|---|---|---|---|
+| unique explanations / 500 | 25 (5%) | **500 (100%)** | **500 (100%)** |
+| content-word F1 vs own gold | — | 0.3819 | 0.3266 |
+| content-word F1 vs other golds | — | 0.2267 | 0.1932 |
+| retrieval acc (vs 19 distractors) | — | **68.4%** | **69.2%** |
+| `<explanation>` extraction failures | 0% | 1.0% | 2.6% |
+
+Mode collapse is gone. Overlap with the gold explanation is only meaningful
+against a control — any two explanations of any vectors share words like
+"vector"/"text"/"activations" — so each generation is also scored against *other*
+rows' golds. Retrieval accuracy (own gold ranked above 19 random distractors) is
+the more trustworthy metric, since correct paraphrase is lexically divergent and
+token-F1 undercounts it.
+
+A held-out sample. The model sees **only a 4096-dim vector** — never the source text:
+
+```
+GOLD: Immediate semantic expectations: The list format with hyphens and colons
+      establishes a pattern where each line provides a specific statistic, so the
+      next line must continue this structured data presentation.
+      Syntactic/structural constraints: The last line "Nearest airport to White
+      Plains: West" is an incomplete noun phrase; "West" is an adjective starting
+      an airport name, requiring a completion like "Westchester County Airport".
+      Final feature: The final token "West" is the initial word of an airport name.
+
+GEN : Syntactic/structural constraint: The hyphenated list item "Airline: West" is
+      incomplete, requiring a completion of the airline name (e.g., "Westchester
+      County Airport").
+      Immediate semantic expectation: The list format promises specific details for
+      each bullet point, so the next token must continue the "Airline" field with
+      the actual airline name or code.
+      Final feature: The last token "West" is the start of a proper noun (airline
+      name) within a bulleted list item, immediately requiring the remainder of that
+      name to complete the entry.
+```
+
+It recovers the truncation point (`"West"`), the document's list structure, and the
+completion (`Westchester County Airport`) from the vector alone. It misreads the
+field label as "Airline" rather than "Nearest airport" — the kind of error that is
+semantically close but lexically costly, and part of why F1 sits at ~0.38 while the
+retrieval score is 68%.
+
+### Known issues
+
+- **Tag-extraction regression.** The 8B actor drops `<explanation>` tags on 1.0%
+  (greedy) / 2.6% (sampled) of rows; the 4B actor never did. The GRPO reward path
+  parses those tags, so this matters for RL.
+- **End-to-end FVE is stale.** The last e2e number (−27.93%) was measured on the
+  pre-fix actor checkpoint and should be re-run before drawing conclusions.
+
 ## License
 
 Apache-2.0

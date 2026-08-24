@@ -59,8 +59,13 @@ class ActorDataset(Dataset):
         raw_prompts = table.column("prompt").to_pylist()
         self.responses = table.column("response").to_pylist()
 
+        # Direct Arrow → numpy (avoids Python-float overhead)
         col = table.column(ACTIVATION_COLUMN)
-        self.vectors = np.array([v.as_py() for v in col], dtype=np.float32)
+        chunked = col.combine_chunks()
+        d_model = chunked.type.list_size
+        self.vectors = chunked.values.to_numpy().reshape(-1, d_model)
+        self.d_model = d_model
+        del table  # free Arrow table
 
         # Swap <INJECT> placeholder → real injection char
         self.prompts = []
@@ -115,8 +120,9 @@ def _get_lr_scheduler(optimizer, args, env: EnvConfig) -> torch.optim.lr_schedul
 def train(args) -> None:
     env = detect()
 
-    # ---- DDP setup -----------------------------------------------------------
-    if args.ddp and env.world_size > 1:
+    # ---- DDP / FSDP setup ----------------------------------------------------
+    use_fsdp_init = getattr(args, "fsdp", False)
+    if (args.ddp or use_fsdp_init) and env.world_size > 1:
         dist.init_process_group(backend="nccl")
         print(f"[rank {env.global_rank}/{env.world_size}] "
               f"device={env.device}  gpu={env.gpu_name}")
@@ -125,9 +131,13 @@ def train(args) -> None:
         print("[ddp] WARNING: --ddp passed but WORLD_SIZE=1 — running single-GPU")
         args.ddp = False
 
+    # fp32 master weights; FSDP MixedPrecision casts to bf16 for compute only.
+    # bf16 masters silently drop optimizer steps below half a bf16 ulp (at |w|~0.02
+    # the ulp is 6.1e-5 vs an AdamW step of ~lr=2e-5) -> backbone never moves.
+    param_dtype = getattr(torch, getattr(args, "param_dtype", "float32"))
     if env.is_main_process:
         print(f"device: {env.device}  dtype: {env.dtype}  "
-              f"ddp: {args.ddp}  world_size: {env.world_size}")
+              f"ddp: {args.ddp}  fsdp: {use_fsdp_init}  world_size: {env.world_size}")
 
     # ---- resolve data path ---------------------------------------------------
     from nla.training.resolve import resolve_parquet
@@ -149,8 +159,18 @@ def train(args) -> None:
         sidecar.get("extraction", {}).get("injection_scale"),
         d_model,
     )
+    if args.injection_scale is not None:
+        injection_scale = resolve_target_scale(args.injection_scale, d_model)
     if injection_scale is None:
-        injection_scale = 2.5 * math.sqrt(d_model)
+        # The original asserts here rather than defaulting -- it is a training
+        # hyperparameter picked as a round number just above the mean L2 norm of
+        # the dataset's vectors (ours: 268 -> 300). The old 2.5*sqrt(d_model)
+        # fallback gave 160, i.e. 60% of the mean, silently.
+        raise SystemExit(
+            "injection_scale is required: pass --injection-scale (e.g. 300, "
+            "'raw', 'sqrt_d_model') or set extraction.injection_scale in the "
+            "sidecar. It is a training hyperparameter -- pick it explicitly."
+        )
     if env.is_main_process:
         print(f"injection_scale: {injection_scale}")
 
@@ -175,13 +195,17 @@ def train(args) -> None:
         prompts, responses, vectors = zip(*batch)
         return list(prompts), list(responses), torch.stack(vectors)
 
+    # Keyed on use_dist, NOT args.ddp: the slurm scripts pass --fsdp alone, so
+    # `if args.ddp` left every rank iterating the FULL dataset instead of its
+    # 1/world_size shard -- 4x the intended work for 1x the data coverage.
+    use_dist = (args.ddp or use_fsdp_init) and env.world_size > 1
     sampler = DistributedSampler(ds, num_replicas=env.world_size,
                                   rank=env.global_rank,
-                                  shuffle=True) if args.ddp else None
+                                  shuffle=True) if use_dist else None
     dl = DataLoader(ds, batch_size=args.micro_batch_size,
                     shuffle=(sampler is None),
                     sampler=sampler,
-                    drop_last=args.ddp,
+                    drop_last=use_dist,  # avoid uneven batch across ranks
                     collate_fn=_collate)
 
     # ---- model ---------------------------------------------------------------
@@ -194,34 +218,70 @@ def train(args) -> None:
         if env.is_main_process:
             print(f"resuming actor from {resume_path} ...")
         model = AutoModelForCausalLM.from_pretrained(
-            resume_path, torch_dtype=env.dtype,
+            resume_path, torch_dtype=param_dtype,
             device_map={"": env.device} if not args.ddp else None,
         )
     else:
         if env.is_main_process:
             print(f"loading {args.model_name} ...")
         model = AutoModelForCausalLM.from_pretrained(
-            args.model_name, torch_dtype=env.dtype,
+            args.model_name, torch_dtype=param_dtype,
             device_map={"": env.device} if not args.ddp else None,
         )
     if env.is_mps:
         model = model.to(env.device)
-    if args.ddp:
+    if args.ddp or args.fsdp:
         model = model.to(env.device)
     model.train()
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
 
-    if args.ddp:
+    use_fsdp = getattr(args, "fsdp", False)
+    if use_fsdp:
+        from functools import partial
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            ShardingStrategy,
+            MixedPrecision,
+        )
+        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+
+        auto_wrap = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={Qwen3DecoderLayer,},
+        )
+        mixed_precision = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            buffer_dtype=torch.float32,
+        )
+        model = FSDP(
+            model,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            auto_wrap_policy=auto_wrap,
+            mixed_precision=mixed_precision,
+            device_id=env.local_rank if torch.cuda.is_available() else None,
+        )
+    elif args.ddp:
         # find_unused_parameters=True because injection hook may skip some params
         model = DDP(model, device_ids=[env.local_rank] if torch.cuda.is_available() else None,
                     find_unused_parameters=True)
 
     if env.is_main_process:
-        m = model.module if args.ddp else model
-        print(f"actor: {m.config.num_hidden_layers} layers  d_model={m.config.hidden_size}")
+        m = model.module if (args.ddp and not use_fsdp) else model
+        print(f"actor: {m.config.num_hidden_layers} layers  d_model={m.config.hidden_size}  "
+              f"sharding={'FSDP' if use_fsdp else 'DDP' if args.ddp else 'none'}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    if args.ddp and env.world_size > 1:
+        from torch.distributed.optim import ZeroRedundancyOptimizer
+        optimizer = ZeroRedundancyOptimizer(
+            model.parameters(),
+            optimizer_class=torch.optim.AdamW,
+            lr=args.lr,
+        )
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     lr_scheduler = _get_lr_scheduler(optimizer, args, env)
 
     # ---- gradient accumulation ------------------------------------------------
@@ -238,13 +298,130 @@ def train(args) -> None:
     losses = []
 
     def _save():
-        if not env.is_main_process:
-            return
         save_dir = Path(args.output_dir)
-        model_to_save = model.module if args.ddp else model
-        model_to_save.save_pretrained(str(save_dir))
-        tokenizer.save_pretrained(str(save_dir))
-        print(f"  checkpoint saved → {save_dir}  (step {opt_step})")
+        if use_fsdp:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            # ALL ranks must enter the context — FSDP state dict is collective.
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
+                full_sd = model.state_dict()
+            if env.is_main_process:
+                # Masters stay fp32 in memory; the ARTIFACT is bf16 (31GB -> 16GB),
+                # matching the critic checkpoint and what RL/eval load anyway.
+                full_sd = {k: (v.to(torch.bfloat16) if v.is_floating_point() else v)
+                           for k, v in full_sd.items()}
+                model.module.save_pretrained(str(save_dir), state_dict=full_sd)
+                tokenizer.save_pretrained(str(save_dir))
+                print(f"  checkpoint saved → {save_dir}  (step {opt_step})")
+        else:
+            if env.is_main_process:
+                model_to_save = model.module if args.ddp else model
+                model_to_save.save_pretrained(str(save_dir))
+                tokenizer.save_pretrained(str(save_dir))
+                print(f"  checkpoint saved → {save_dir}  (step {opt_step})")
+
+    def _batch_loss(messages_batch, responses_batch, vectors_batch, model_fwd):
+        """Tokenize a batch, inject vectors at the marked position, return CE loss.
+
+        Shared by the training step and the held-out eval so the two can never
+        drift apart in template, padding, or injection scale.
+        """
+        texts = []
+        for msgs, resp in zip(messages_batch, responses_batch):
+            prompt_str = tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True,
+            )
+            texts.append(prompt_str + resp)
+
+        prompt_only = [
+            tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            for msgs in messages_batch
+        ]
+
+        prompt_enc = tokenizer(
+            prompt_only, padding=True, truncation=True,
+            max_length=args.max_length, return_tensors="pt",
+        )
+        full_enc = tokenizer(
+            texts, padding=True, truncation=True,
+            max_length=args.max_length, return_tensors="pt",
+        )
+
+        input_ids = full_enc["input_ids"].to(env.device)
+        attention_mask = full_enc["attention_mask"].to(env.device)
+
+        # Labels: -100 for prompt tokens, actual ids for response
+        labels = input_ids.clone()
+        prompt_lens = prompt_enc["attention_mask"].sum(dim=1)
+        for b in range(len(prompt_lens)):
+            labels[b, :prompt_lens[b]] = -100
+        # Right-padding is scored otherwise: pad == eos is trivially predictable,
+        # so ~15% of targets were free wins that flattered the reported CE.
+        # --legacy-unmasked-loss reproduces the pre-2026-08-23 objective EXACTLY
+        # (pad scored as targets + ce.mean() over all positions). It exists to
+        # settle one question: was the null conditioning gap caused by the loss
+        # bug, or simply by stopping at too few steps? Never use it for a real run.
+        if not getattr(args, "legacy_unmasked_loss", False):
+            labels[attention_mask == 0] = -100
+
+        # sft_loss() without a mask returns ce.mean() over ALL positions, and
+        # cross_entropy(reduction="none") writes 0.0 at every -100 slot. That
+        # divides by prompt+response+pad instead of response alone -- response is
+        # ~51% of tokens, so the loss (and its gradient) came out ~2x too small.
+        # The original passes --loss-mask-type qwen for exactly this reason.
+        loss_mask = None if getattr(args, "legacy_unmasked_loss", False) \
+            else (labels != -100).float()
+
+        vectors = normalize_activation(vectors_batch.to(env.device), injection_scale)
+
+        embed = model_fwd.get_input_embeddings()
+
+        def _hook(module, _args, output):
+            return inject_at_marked_positions(
+                input_ids, output, vectors, inj_id, left_id, right_id,
+            )
+
+        hook = embed.register_forward_hook(_hook)
+        try:
+            with torch.autocast(device_type=env.device.type, dtype=env.dtype,
+                                enabled=env.amp_enabled):
+                outputs = model_fwd(input_ids=input_ids, attention_mask=attention_mask)
+                return sft_loss(outputs.logits, labels, loss_mask)
+        finally:
+            hook.remove()
+
+    # ---- held-out eval -------------------------------------------------------
+    eval_dl = None
+    if args.eval_data:
+        eval_ds = ActorDataset(resolve_parquet(args.eval_data), injection_char)
+        n_eval = min(args.eval_samples, len(eval_ds))
+        # Fixed subset, same on every rank and every eval -> steps are comparable.
+        eval_idx = np.random.default_rng(0).permutation(len(eval_ds))[:n_eval].tolist()
+        eval_dl = DataLoader(torch.utils.data.Subset(eval_ds, eval_idx),
+                             batch_size=args.eval_batch_size, shuffle=False,
+                             collate_fn=_collate)
+        if env.is_main_process:
+            print(f"eval: {n_eval} held-out rows from {args.eval_data}")
+
+    def _run_eval(tag):
+        """Mean per-token CE on the held-out set. All ranks run it (FSDP forward
+        is collective); only rank 0 prints."""
+        if eval_dl is None:
+            return None
+        model.eval()
+        tot, nb = 0.0, 0
+        with torch.no_grad():
+            for mb, rb, vb in eval_dl:
+                fwd = model.module if (args.ddp and not use_fsdp) else model
+                tot += _batch_loss(mb, rb, vb, fwd).item()
+                nb += 1
+        model.train()
+        avg = tot / max(nb, 1)
+        if env.is_main_process:
+            print(f"  [eval] {tag}: held-out CE = {avg:.4f}  (ppl {math.exp(min(avg, 20)):.2f})",
+                  flush=True)
+        return avg
 
     while opt_step < args.num_steps:
         if sampler is not None:
@@ -260,66 +437,10 @@ def train(args) -> None:
             if opt_step >= args.num_steps:
                 break
 
-            model_fwd = model.module if args.ddp else model
+            model_fwd = model.module if (args.ddp and not getattr(args, 'fsdp', False)) else model
 
-            # Build [prompt | response] conversations and tokenize
-            texts = []
-            for msgs, resp in zip(messages_batch, responses_batch):
-                prompt_str = tokenizer.apply_chat_template(
-                    msgs, tokenize=False, add_generation_prompt=True,
-                )
-                texts.append(prompt_str + resp)
-
-            prompt_only = [
-                tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-                for msgs in messages_batch
-            ]
-
-            prompt_enc = tokenizer(
-                prompt_only, padding=True, truncation=True,
-                max_length=args.max_length, return_tensors="pt",
-            )
-            full_enc = tokenizer(
-                texts, padding=True, truncation=True,
-                max_length=args.max_length, return_tensors="pt",
-            )
-
-            input_ids = full_enc["input_ids"].to(env.device)
-            attention_mask = full_enc["attention_mask"].to(env.device)
-
-            # Labels: -100 for prompt tokens, actual ids for response
-            labels = input_ids.clone()
-            prompt_lens = prompt_enc["attention_mask"].sum(dim=1)
-            for b in range(len(prompt_lens)):
-                labels[b, :prompt_lens[b]] = -100
-
-            # Normalize activation vectors
-            vectors = vectors_batch.to(env.device)
-            vectors = normalize_activation(vectors, injection_scale)
-
-            # Register injection hook
-            embed = model_fwd.get_input_embeddings()
-
-            def _make_hook(_input_ids, _vectors, _inj_id, _left_id, _right_id):
-                def _hook(module, args, output):
-                    return inject_at_marked_positions(
-                        _input_ids, output, _vectors,
-                        _inj_id, _left_id, _right_id,
-                    )
-                return _hook
-
-            hook = embed.register_forward_hook(
-                _make_hook(input_ids, vectors, inj_id, left_id, right_id)
-            )
-
-            try:
-                with torch.autocast(device_type=env.device.type, dtype=env.dtype,
-                                    enabled=env.amp_enabled):
-                    outputs = model_fwd(input_ids=input_ids, attention_mask=attention_mask)
-                    loss = sft_loss(outputs.logits, labels)
-                    loss = loss / grad_accum
-            finally:
-                hook.remove()
+            loss = _batch_loss(messages_batch, responses_batch,
+                               vectors_batch, model_fwd) / grad_accum
 
             loss.backward()
             accum_loss += loss.item() * grad_accum
@@ -342,6 +463,9 @@ def train(args) -> None:
                 if env.is_mps and opt_step % 5 == 0:
                     torch.mps.empty_cache()
 
+                if args.eval_every and opt_step % args.eval_every == 0 and opt_step > 0:
+                    _run_eval(f"step {opt_step}")
+
                 if opt_step % args.save_every == 0 and opt_step > 0:
                     _save()
 
@@ -354,14 +478,18 @@ def train(args) -> None:
             break
 
     # ---- final save ----------------------------------------------------------
-    if args.ddp:
+    if use_dist:
         dist.barrier()
+    _run_eval(f"final (step {opt_step})")
     avg_loss = sum(losses) / len(losses) if losses else 0
     if env.is_main_process:
         print(f"\nfinal loss: {avg_loss:.4f}  ({len(losses)} steps)")
-        _save()
+    # NOT inside is_main_process: FSDP's FULL_STATE_DICT gather is a COLLECTIVE.
+    # Rank-0-only entry deadlocks until the other ranks exit and NCCL SIGABRTs.
+    # _save() writes on rank 0 only, internally.
+    _save()
 
-    if args.ddp:
+    if use_dist:
         dist.destroy_process_group()
 
 
@@ -381,6 +509,15 @@ def main() -> None:
     p.add_argument("--micro-batch-size", type=int, default=2)
     p.add_argument("--global-batch-size", type=int, default=None,
                    help="global batch size for gradient accumulation (DDP: micro*gpus*accum)")
+    p.add_argument("--legacy-unmasked-loss", action="store_true",
+                   help="DEBUG ONLY: restore the pre-fix objective (pad scored, "
+                        "CE averaged over all positions). Controlled experiment "
+                        "for the loss-bug-vs-too-few-steps question.")
+    p.add_argument("--injection-scale", type=str, default=None,
+                   help="L2 norm to rescale activation vectors to before "
+                        "injection. Float, 'raw', or 'sqrt_d_model'. Overrides "
+                        "the sidecar. Rule of thumb: a round number just above "
+                        "the dataset's mean vector norm.")
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--min-lr", type=float, default=None,
                    help="minimum LR for cosine decay (default: same as --lr)")
@@ -397,6 +534,17 @@ def main() -> None:
                    help="resume from checkpoint in --output-dir")
     p.add_argument("--ddp", action="store_true",
                    help="enable DistributedDataParallel (use with torchrun)")
+    p.add_argument("--param-dtype", default="float32",
+                   choices=["float32", "bfloat16"],
+                   help="master weight dtype (float32 = fp32 masters + bf16 compute)")
+    p.add_argument("--eval-data", default=None,
+                   help="held-out AV-SFT parquet for periodic CE eval")
+    p.add_argument("--eval-every", type=int, default=0,
+                   help="run held-out eval every N optimizer steps (0 = off)")
+    p.add_argument("--eval-samples", type=int, default=1024)
+    p.add_argument("--eval-batch-size", type=int, default=8)
+    p.add_argument("--fsdp", action="store_true",
+                   help="enable FullyShardedDataParallel / ZeRO-3 (use with torchrun)")
     args = p.parse_args()
 
     # Defaults
