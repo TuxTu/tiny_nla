@@ -25,7 +25,7 @@ export HF_HUB_OFFLINE=1
 export PYTHONPATH="$PROJ${PYTHONPATH:+:$PYTHONPATH}"
 cd "$PROJ"
 
-ACTOR=${ACTOR:-$PROJ/checkpoints/actor_sft_8b_s50}
+ACTOR=${ACTOR:-$PROJ/checkpoints/actor_sft_8b_s50fix}
 CRITIC=${CRITIC:-$PROJ/checkpoints/critic_sft_8b_s50}
 DATA=$PROJ/data/av_eval_8b_ufw_joined.parquet
 N=${N:-500}

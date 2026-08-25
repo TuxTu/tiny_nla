@@ -324,6 +324,7 @@ def train(args) -> None:
     if args.kl_coef > 0:
         if env.is_main_process:
             print(f"loading reference model from {args.actor_ckpt} ...")
+        # Also unsharded on every rank: 8B bf16 = 16 GB/GPU. Budget accordingly.
         ref_model = AutoModelForCausalLM.from_pretrained(
             args.actor_ckpt, torch_dtype=torch.bfloat16,  # frozen, inference only
             device_map={"": env.device} if not (args.ddp and not use_fsdp) else None,
@@ -336,6 +337,28 @@ def train(args) -> None:
         for p in ref_model.parameters():
             p.requires_grad_(False)
         ref_embed = ref_model.get_input_embeddings()
+        # Shard it. Frozen and inference-only, but an unsharded 8B bf16 copy is
+        # 16 GB on EVERY rank; FULL_SHARD across 4 ranks makes that ~4 GB, which
+        # is 12 GB/GPU back for rollout batch. Grab the embedding BEFORE wrapping
+        # -- FSDP rewrites module attributes and the injection hook needs the
+        # real embedding module.
+        if use_fsdp:
+            from functools import partial
+            from torch.distributed.fsdp import (
+                FullyShardedDataParallel as _FSDP, ShardingStrategy as _SS,
+                MixedPrecision as _MP,
+            )
+            from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy as _wrap
+            from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer as _Layer
+            ref_model = _FSDP(
+                ref_model,
+                sharding_strategy=_SS.FULL_SHARD,
+                auto_wrap_policy=partial(_wrap, transformer_layer_cls={_Layer}),
+                mixed_precision=_MP(param_dtype=torch.bfloat16,
+                                    reduce_dtype=torch.bfloat16,
+                                    buffer_dtype=torch.bfloat16),
+                device_id=env.local_rank if torch.cuda.is_available() else None,
+            )
 
     # ---- critic model --------------------------------------------------------
     critic_ckpt = args.critic_ckpt
@@ -351,9 +374,16 @@ def train(args) -> None:
     else:
         if env.is_main_process:
             print(f"loading critic from {critic_ckpt} ...")
+    # A FROZEN critic is inference-only, so it needs neither fp32 masters nor
+    # gradients -- and it is NOT FSDP-wrapped below (see `use_fsdp and not
+    # freeze_critic`), so at fp32 it sits as a full 22.4 GB copy on EVERY rank.
+    # That is why --freeze-critic did not reduce peak memory: it swapped 22.4 GB
+    # of sharded grads+optimiser state for 22.4 GB of unsharded weights.
+    # bf16 halves it to 11.2 GB.
+    critic_dtype = torch.bfloat16 if args.freeze_critic else param_dtype
     critic = NLACriticModel.from_pretrained(
         critic_ckpt,
-        torch_dtype=param_dtype,
+        torch_dtype=critic_dtype,
         device_map={"": env.device} if not (args.ddp and not use_fsdp) else None,
     )
     if env.is_mps:
@@ -633,13 +663,19 @@ def train(args) -> None:
                         StateDictType,
                     )
                     # 1. Gather full state dict (all ranks must enter this ctx)
-                    cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                    # rank0_only=False: EVERY rank takes the weights so every rank
+                    # can generate. An 8B bf16 copy is ~16 GB and fits on one 80 GB
+                    # card, so the old rank-0-only design left 3 GPUs idle through
+                    # the phase that dominates step time. Peak memory is unchanged
+                    # -- rank 0 already carried this copy; ranks 1-3 simply stop
+                    # wasting the headroom they had free.
+                    cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
                     with FSDP.state_dict_type(actor, StateDictType.FULL_STATE_DICT, cfg):
                         full_sd = actor.state_dict()
 
-                    gen_responses = None  # list of (resp_text, token_ids) on rank 0
+                    gen_responses = None  # (prompt_idx, sample_idx, text, tokens)
 
-                    if env.is_main_process:
+                    if True:
                         # 2. Load into a standalone model (no FSDP) for clean .generate()
                         gen_model = AutoModelForCausalLM.from_pretrained(
                             args.actor_ckpt, torch_dtype=torch.bfloat16,  # rollout only
@@ -652,8 +688,16 @@ def train(args) -> None:
                         # 3. Generate — standard HF .generate(), no FSDP overhead
                         gen_model_embed = gen_model.get_input_embeddings()
                         _gen_responses = []
+                        # Strided split so each rank takes a disjoint slice of the
+                        # prompts. Results carry (prompt_idx, sample_idx) and are
+                        # re-sorted after the gather -- downstream code maps sample
+                        # -> vector by `gold_idx = s_idx // N`, so ORDER IS LOAD-BEARING.
+                        _my_prompts = list(range(env.global_rank, len(prompt_texts),
+                                                 env.world_size)) if env.ddp_enabled else \
+                                      list(range(len(prompt_texts)))
                         with torch.no_grad():
-                            for i, prompt_text in enumerate(prompt_texts):
+                            for i in _my_prompts:
+                                prompt_text = prompt_texts[i]
                                 prompt_enc = tokenizer(
                                     prompt_text, return_tensors="pt",
                                     truncation=True, max_length=args.max_length,
@@ -693,16 +737,20 @@ def train(args) -> None:
                                     seq = gen_out[s]
                                     resp_ids = seq[prompt_ids.shape[1]:]
                                     resp_text = tokenizer.decode(resp_ids, skip_special_tokens=True)
-                                    _gen_responses.append((resp_text, seq.cpu()))
+                                    _gen_responses.append((i, s, resp_text, seq.cpu()))
 
                         gen_responses = _gen_responses
                         del gen_model
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
 
-                    # 4. Broadcast results to all ranks
-                    gen_responses = _broadcast_object(gen_responses, env, src=0)
-                    for resp_text, seq in gen_responses:
+                    # 4. All-gather each rank's slice, then restore global order
+                    if env.ddp_enabled:
+                        _parts = [None] * env.world_size
+                        dist.all_gather_object(_parts, gen_responses)
+                        gen_responses = [x for part in _parts for x in part]
+                    gen_responses.sort(key=lambda t: (t[0], t[1]))
+                    for _pi, _si, resp_text, seq in gen_responses:
                         all_responses.append(resp_text)
                         all_tokens.append(seq.to(env.device))
 
