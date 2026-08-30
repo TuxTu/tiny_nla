@@ -17,12 +17,14 @@ export PATH="$CONDA_ENV/bin:$PATH"
 export LD_LIBRARY_PATH="$CONDA_ENV/lib:${LD_LIBRARY_PATH:-}"
 PROJ=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla
 export HF_HOME=$PROJ/cache/huggingface
+export TORCHINDUCTOR_CACHE_DIR=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla/cache/torchinductor   # else torch defaults to /tmp/torchinductor_$USER
 export HF_HUB_OFFLINE=1
 export PYTHONPATH="$PROJ${PYTHONPATH:+:$PYTHONPATH}"
 cd "$PROJ"
 
-LOCAL_DIR="/tmp/nla_${SLURM_JOB_ID}"
+LOCAL_DIR="$PROJ/tmp/nla_${SLURM_JOB_ID}"
 mkdir -p "$LOCAL_DIR"
+trap 'rm -rf "$LOCAL_DIR"' EXIT   # $PROJ/tmp is NOT node-wiped
 for f in av_sft_train_8b_ufw_joined av_eval_8b_ufw_joined; do
     cp "$PROJ/data/$f.parquet" "$LOCAL_DIR/"
     cp "$PROJ/data/$f.parquet.nla_meta.yaml" "$LOCAL_DIR/"

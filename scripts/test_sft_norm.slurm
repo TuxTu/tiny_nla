@@ -15,6 +15,7 @@ CONDA_ENV=/home/x_tuhan/.conda/envs/tiny_nla
 export PATH="$CONDA_ENV/bin:$PATH"
 export LD_LIBRARY_PATH="$CONDA_ENV/lib:$LD_LIBRARY_PATH"
 export HF_HOME=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla/cache/huggingface
+export TORCHINDUCTOR_CACHE_DIR=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla/cache/torchinductor   # else torch defaults to /tmp/torchinductor_$USER
 mkdir -p "$HF_HOME"
 PROJ=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla
 

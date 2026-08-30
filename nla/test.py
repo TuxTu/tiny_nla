@@ -1,5 +1,5 @@
 import pyarrow.parquet as pq
-t = pq.read_table('/tmp/nla_test_explained.parquet')
+t = pq.read_table('tmp/nla_test_explained.parquet')
 print(f'rows: {t.num_rows}')
 for row in t.to_pylist():
     doc = row['doc_id']

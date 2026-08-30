@@ -14,6 +14,7 @@ export PATH="$CONDA_ENV/bin:$PATH"
 export LD_LIBRARY_PATH="$CONDA_ENV/lib:${LD_LIBRARY_PATH:-}"
 PROJ=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla
 export HF_HOME=$PROJ/cache/huggingface
+export TORCHINDUCTOR_CACHE_DIR=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla/cache/torchinductor   # else torch defaults to /tmp/torchinductor_$USER
 export HF_HUB_OFFLINE=1
 export PYTHONPATH="$PROJ${PYTHONPATH:+:$PYTHONPATH}"
 cd "$PROJ"

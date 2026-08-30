@@ -23,10 +23,11 @@ export PATH="$CONDA_ENV/bin:$PATH"
 export LD_LIBRARY_PATH="$CONDA_ENV/lib:${LD_LIBRARY_PATH:-}"
 PROJ=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla
 export HF_HOME=$PROJ/cache/huggingface
+export TORCHINDUCTOR_CACHE_DIR=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla/cache/torchinductor   # else torch defaults to /tmp/torchinductor_$USER
 export HF_HUB_OFFLINE=1
 export PYTHONPATH="$PROJ${PYTHONPATH:+:$PYTHONPATH}"
 cd "$PROJ"
-CKPT=${CKPT:-$PROJ/checkpoints/rl_snapshots/step50_actor}  # /tmp is NODE-LOCAL: a login-node copy is invisible to compute nodes
+CKPT=${CKPT:-$PROJ/checkpoints/rl_snapshots/step50_actor}  # never /tmp: forbidden on Berzelius AND node-local, so a login-node copy is invisible here
 DATA=$PROJ/data/av_eval_8b_ufw_joined.parquet
 
 echo "########## generation quality: $CKPT ##########"

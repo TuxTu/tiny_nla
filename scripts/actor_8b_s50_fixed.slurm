@@ -29,6 +29,7 @@ export PATH="$CONDA_ENV/bin:$PATH"
 export LD_LIBRARY_PATH="$CONDA_ENV/lib:${LD_LIBRARY_PATH:-}"
 PROJ=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla
 export HF_HOME=$PROJ/cache/huggingface
+export TORCHINDUCTOR_CACHE_DIR=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla/cache/torchinductor   # else torch defaults to /tmp/torchinductor_$USER
 export HF_HUB_OFFLINE=1
 export PYTHONPATH="$PROJ${PYTHONPATH:+:$PYTHONPATH}"
 cd "$PROJ"
@@ -42,8 +43,9 @@ N_ROWS=$(python -c "import pyarrow.parquet as pq;print(pq.ParquetFile('$TRAIN').
 NUM_STEPS=$(( N_ROWS * EPOCHS / GLOBAL_BATCH ))
 echo "train rows=$N_ROWS  epochs=$EPOCHS  -> num_steps=$NUM_STEPS"
 
-LOCAL_DIR="/tmp/nla_${SLURM_JOB_ID}"
+LOCAL_DIR="$PROJ/tmp/nla_${SLURM_JOB_ID}"
 mkdir -p "$LOCAL_DIR"
+trap 'rm -rf "$LOCAL_DIR"' EXIT   # $PROJ/tmp is NOT node-wiped
 cp "$TRAIN" "$TRAIN.nla_meta.yaml" "$EVAL" "$EVAL.nla_meta.yaml" "$LOCAL_DIR/"
 
 torchrun --nproc_per_node=4 --master_port=29677 \
