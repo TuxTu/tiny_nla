@@ -321,7 +321,8 @@ def train(args) -> None:
                 tokenizer.save_pretrained(str(save_dir))
                 print(f"  checkpoint saved → {save_dir}  (step {opt_step})")
 
-    def _batch_loss(messages_batch, responses_batch, vectors_batch, model_fwd):
+    def _batch_loss(messages_batch, responses_batch, vectors_batch, model_fwd,
+                    vec_mode="correct"):
         """Tokenize a batch, inject vectors at the marked position, return CE loss.
 
         Shared by the training step and the held-out eval so the two can never
@@ -373,7 +374,15 @@ def train(args) -> None:
         loss_mask = None if getattr(args, "legacy_unmasked_loss", False) \
             else (labels != -100).float()
 
-        vectors = normalize_activation(vectors_batch.to(env.device), injection_scale)
+        # vec_mode drives the conditioning-gap eval. "zeros" must NOT go through
+        # normalize_activation: a zero row has norm 0, which clamps to 1e-12 and
+        # then divides into a huge vector -- the opposite of "no information".
+        if vec_mode == "zeros":
+            vectors = torch.zeros(vectors_batch.shape[0], vectors_batch.shape[1],
+                                  device=env.device, dtype=torch.float32)
+        else:
+            vb = vectors_batch if vec_mode == "correct" else vectors_batch.roll(1, 0)
+            vectors = normalize_activation(vb.to(env.device), injection_scale)
 
         embed = model_fwd.get_input_embeddings()
 
@@ -405,23 +414,37 @@ def train(args) -> None:
             print(f"eval: {n_eval} held-out rows from {args.eval_data}")
 
     def _run_eval(tag):
-        """Mean per-token CE on the held-out set. All ranks run it (FSDP forward
-        is collective); only rank 0 prints."""
+        """Held-out CE, plus the conditioning gap when --eval-gap is set.
+
+        CE alone cannot tell "learned to read the vector" from "learned the
+        marginal distribution of explanations": the pre-2026-08-23 actor trained
+        to a healthy CE curve with a gap of +0.0013. The gap is the metric that
+        catches that, so log it per eval rather than only at the end.
+        """
         if eval_dl is None:
             return None
         model.eval()
-        tot, nb = 0.0, 0
+        modes = ("correct", "shuffled", "zeros") if args.eval_gap else ("correct",)
+        tot = {m: 0.0 for m in modes}
+        nb = 0
         with torch.no_grad():
             for mb, rb, vb in eval_dl:
                 fwd = model.module if (args.ddp and not use_fsdp) else model
-                tot += _batch_loss(mb, rb, vb, fwd).item()
+                for m in modes:
+                    tot[m] += _batch_loss(mb, rb, vb, fwd, vec_mode=m).item()
                 nb += 1
         model.train()
-        avg = tot / max(nb, 1)
+        avg = {m: tot[m] / max(nb, 1) for m in modes}
         if env.is_main_process:
-            print(f"  [eval] {tag}: held-out CE = {avg:.4f}  (ppl {math.exp(min(avg, 20)):.2f})",
-                  flush=True)
-        return avg
+            line = (f"  [eval] {tag}: held-out CE = {avg['correct']:.4f}  "
+                    f"(ppl {math.exp(min(avg['correct'], 20)):.2f})")
+            if args.eval_gap:
+                gap = avg["shuffled"] - avg["correct"]
+                zgap = avg["zeros"] - avg["correct"]
+                line += (f"  | shuf={avg['shuffled']:.4f} zero={avg['zeros']:.4f}"
+                         f"  GAP={gap:+.4f}  zero-gap={zgap:+.4f}")
+            print(line, flush=True)
+        return avg["correct"]
 
     while opt_step < args.num_steps:
         if sampler is not None:
@@ -542,6 +565,9 @@ def main() -> None:
     p.add_argument("--eval-every", type=int, default=0,
                    help="run held-out eval every N optimizer steps (0 = off)")
     p.add_argument("--eval-samples", type=int, default=1024)
+    p.add_argument("--eval-gap", action="store_true",
+                   help="also log the conditioning gap (shuffled/zeros vector CE) "
+                        "at every eval -- 3x eval cost, negligible vs step time")
     p.add_argument("--eval-batch-size", type=int, default=8)
     p.add_argument("--fsdp", action="store_true",
                    help="enable FullyShardedDataParallel / ZeRO-3 (use with torchrun)")
