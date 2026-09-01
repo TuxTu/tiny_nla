@@ -77,7 +77,14 @@ def main():
         tbl = pa.table({
             "prompt": pa.array([prompts[i] for i in idx], type=pa.list_(STRUCT)),
             "response": pa.array([targets[i] for i in idx]),
-            "activation_vector": pa.array(list(vecs[idx]), type=pa.list_(pa.float32())),
+            # MUST be fixed_size_list: ActorDataset reads chunked.type.list_size
+            # and reshapes the flat buffer. A variable-size list has no
+            # .list_size and fails at load with an AttributeError.
+            # Built from the flat buffer -- list(vecs[idx]) materialises one
+            # numpy array per row and takes minutes at 150k rows.
+            "activation_vector": pa.FixedSizeListArray.from_arrays(
+                pa.array(np.ascontiguousarray(vecs[idx]).reshape(-1), type=pa.float32()),
+                int(vecs.shape[1])),
             "doc_id": pa.array([str(src.iloc[i].get("task_id", i)) for i in idx]),
             "n_raw_tokens": pa.array([0] * len(idx), type=pa.int64()),
         })

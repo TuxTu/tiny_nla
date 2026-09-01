@@ -98,7 +98,9 @@ def main():
 
     out = pa.table({
         "doc_id": pa.array([f"{args.mode}:{i}" for i in range(len(texts))]),
-        "activation_vector": pa.array(list(vecs), type=pa.list_(pa.float32())),
+        # fixed_size_list, matching what ActorDataset requires
+        "activation_vector": pa.FixedSizeListArray.from_arrays(
+            pa.array(vecs.reshape(-1), type=pa.float32()), int(vecs.shape[1])),
         "activation_layer": pa.array([li] * len(texts), type=pa.int64()),
         "n_raw_tokens": pa.array(
             [len(tok(t, add_special_tokens=True)["input_ids"]) for t in texts], type=pa.int64()),

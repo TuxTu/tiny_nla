@@ -38,10 +38,54 @@ def extract_code(s):
 
 
 def ast_equal(a, b):
+    """NB: ast.dump includes every identifier and literal, so with both sides
+    already ast.unparse'd this is nearly as strict as exact match. It is NOT a
+    structural metric -- see norm_ast for that."""
     try:
         return ast.dump(ast.parse(a)) == ast.dump(ast.parse(b))
     except SyntaxError:
         return False
+
+
+def _parse(s):
+    try:
+        return ast.parse(s or "")
+    except SyntaxError:
+        return None
+
+
+def skeleton(t):
+    """Control flow only: node types, no names or literals. Note the baseline is
+    high (~0.44 between two arbitrary Python functions), so read it against the
+    shuffled control, never on its own."""
+    return [type(n).__name__ for n in ast.walk(t)] if t else None
+
+
+def norm_ast(t):
+    """Structure + literals with identifiers canonicalised -- 'same code modulo
+    renaming'. This is the genuinely lenient structural metric."""
+    if t is None:
+        return None
+    t = ast.parse(ast.unparse(t))
+    m = {}
+    for n in ast.walk(t):
+        for attr in ("id", "arg", "name", "attr"):
+            v = getattr(n, attr, None)
+            if isinstance(v, str):
+                m.setdefault(v, f"V{len(m)}")
+                setattr(n, attr, m[v])
+    return ast.dump(t)
+
+
+def arity(t):
+    if t is None:
+        return -1
+    return next((len(n.args.args) for n in ast.walk(t)
+                 if isinstance(n, ast.FunctionDef)), -1)
+
+
+def idents(s):
+    return set(re.findall(r"[A-Za-z_]\w*", s or ""))
 
 
 def main():
@@ -126,12 +170,38 @@ def main():
     parse = sum(_safe_parse(r["pred"]) for r in ok)
     sims = [difflib.SequenceMatcher(None, r["pred"].split(), r["target"].split()).ratio() for r in ok]
 
+    # Graded ladder. Exact match sits at 0 long before conditioning is dead, so
+    # it is useless for tracking progress; token overlap is worse than useless
+    # because two arbitrary Python functions score ~0.15 on shared boilerplate.
+    # Retrieval is the metric this project already validated on text (68% vs 5%).
+    pts = [(_parse(r["pred"]), _parse(r["target"])) for r in ok]
+    skel = [difflib.SequenceMatcher(None, skeleton(p), skeleton(t)).ratio()
+            for p, t in pts if p is not None and t is not None]
+    nast = sum(norm_ast(p) == norm_ast(t) for p, t in pts
+               if p is not None and t is not None)
+    nar = sum(arity(p) == arity(t) for p, t in pts if p is not None and t is not None)
+    jac = [len(idents(r["pred"]) & idents(r["target"])) /
+           max(len(idents(r["pred"]) | idents(r["target"])), 1) for r in ok]
+    tgts = [r["target"] for r in ok]
+    r1 = 0
+    for i, r in enumerate(ok):
+        sc = [difflib.SequenceMatcher(None, (r["pred"] or "").split(), t.split()).ratio()
+              for t in tgts]
+        if sc and int(np.argmax(sc)) == i:
+            r1 += 1
+
     print("\n" + "=" * 62)
     print(f"n={n}  extracted={len(ok)} ({len(ok)/max(n,1):.0%})")
     print(f"exact match   : {exact}/{len(ok)}  ({exact/max(len(ok),1):.1%})")
     print(f"AST-equal     : {aeq}/{len(ok)}  ({aeq/max(len(ok),1):.1%})")
     print(f"parses        : {parse}/{len(ok)}  ({parse/max(len(ok),1):.1%})")
     print(f"token overlap : mean={np.mean(sims):.3f}  median={np.median(sims):.3f}")
+    print(f"norm-AST equal: {nast}/{len(ok)}   (same code modulo renaming)")
+    print(f"skeleton sim  : {np.mean(skel):.3f}  (~0.44 baseline; compare vs shuffled)")
+    print(f"identifier Jac: {np.mean(jac):.3f}")
+    print(f"arity match   : {nar}/{len(ok)}")
+    print(f"RETRIEVAL rank-1: {r1}/{len(ok)}  ({100*r1/max(len(ok),1):.1f}%)  "
+          f"chance {100/max(len(ok),1):.2f}%")
     print("=" * 62)
 
     if args.out:
@@ -140,9 +210,12 @@ def main():
             f.write(json.dumps({"kind": "summary", "n": n, "extracted": len(ok),
                                 "exact": exact, "ast_equal": aeq, "parses": parse,
                                 "tok_sim_mean": float(np.mean(sims)) if sims else None,
+                                "norm_ast": nast, "skeleton": float(np.mean(skel)) if skel else None,
+                                "ident_jaccard": float(np.mean(jac)) if jac else None,
+                                "arity": nar, "retrieval_rank1": r1,
                                 "shuffle_control": args.shuffle_control,
                                 "ckpt": args.actor_ckpt, "data": args.data}) + "\n")
-            for r in rows[:40]:
+            for r in rows:
                 f.write(json.dumps({"kind": "sample", **r}) + "\n")
         print(f"wrote {args.out}")
 
