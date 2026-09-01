@@ -326,6 +326,10 @@ def main():
                    help=f"HF model ID for tokenizer (default: {DEFAULT_MODEL_NAME})")
     p.add_argument("--actor-ckpt", type=str, default=DEFAULT_ACTOR_CKPT,
                    help=f"Path to actor SFT checkpoint (default: {DEFAULT_ACTOR_CKPT})")
+    p.add_argument("--actor-subfolder", default=None,
+                   help="folder inside a Hub repo, e.g. nla/actor")
+    p.add_argument("--critic-subfolder", default=None,
+                   help="folder inside a Hub repo, e.g. nla/critic")
     p.add_argument("--critic-ckpt", type=str, default=DEFAULT_CRITIC_CKPT,
                    help=f"Path to critic SFT checkpoint (default: {DEFAULT_CRITIC_CKPT})")
     p.add_argument("--sidecar", type=str, default=DEFAULT_SIDECAR,

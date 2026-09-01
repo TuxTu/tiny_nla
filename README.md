@@ -461,3 +461,89 @@ the ceiling — is the baseline RL actually starts from.
 ## License
 
 Apache-2.0
+
+---
+
+## Testing the models (for collaborators)
+
+Weights live on the Hub, code lives here. You need both.
+
+```bash
+git clone git@github.com:TuxTu/tiny_nla.git && cd tiny_nla
+pip install torch transformers huggingface_hub pyarrow numpy pyyaml
+hf auth login          # the repo is private — you need access
+```
+
+Everything below downloads weights on first run (~16 GB per model, cached
+afterwards) and needs one GPU with ≥40 GB.
+
+### Reconstruct a Python function from its activation vector
+
+```bash
+python scripts/nla_code_infer.py \
+    --actor-ckpt TuHan/tiny-nla --subfolder code-decoder \
+    --code 'def gcd(a, b):
+    while b:
+        a, b = (b, a % b)
+    return a'
+```
+
+Prints the original, the reconstruction, and three scores. Add `--control` to
+also generate from a random vector, which shows what the code prior produces
+with no information — the comparison that makes the output meaningful.
+
+Give it a file instead with `--file mymodule.py`.
+
+**What to expect.** This is not a lossless codec. On a 300-function held-out set:
+
+| | |
+|---|---|
+| exact string match | 1.0% |
+| identical modulo renaming | 3.7% |
+| AST-skeleton > 0.9 (near-identical shape) | 7.7% |
+| retrieval@1 — is the output nearest its own target of 300? | **71%** |
+| identifier recall | 17% |
+
+So it reliably tells you *which* function a vector came from, usually gets the
+shape and domain right, and usually gets the specific names wrong. The typical
+error is a **sibling**: ask it for `send_video` and you get `send_document`,
+same signature, same parameters, wrong entity.
+
+### Explain a text activation vector
+
+```bash
+python scripts/nla_infer.py \
+    --actor-ckpt TuHan/tiny-nla --actor-subfolder nla/actor \
+    --critic-ckpt TuHan/tiny-nla --critic-subfolder nla/critic \
+    --text "The Federal Reserve announced yesterday that it would raise rates"
+```
+
+Actor writes an explanation of the vector; critic reads the explanation back to
+a vector; FVE scores the round trip. Gold-explanation ceiling is +0.6165.
+
+### What is in the Hub repo
+
+```
+TuHan/tiny-nla
+  nla/actor/         text actor, 3 epochs on 124,741 rows, conditioning gap +0.4593
+  nla/critic/        critic, 65.7% held-out FVE
+  code-decoder/      code reconstruction  + centre_mean.npy  + nla_meta.yaml
+```
+
+**`code-decoder` requires `centre_mean.npy`.** It was trained on mean-centred
+vectors, and the offset carries ~82% of a typical vector's magnitude — inject a
+raw vector and the model produces fluent, plausible, completely unrelated code.
+`nla_code_infer.py` fetches it automatically when you pass `--subfolder`; if you
+load the weights yourself, subtract it before injecting.
+
+### Reading the numbers
+
+Every metric should be compared against its control, not against zero:
+
+- `--control` / shuffled vector is the floor. For round-trip FVE that floor is
+  about **−0.78**, not 0, so a raw score of 0.14 can still be most of the
+  available signal.
+- Two arbitrary Python functions already share **~0.52** AST-skeleton
+  similarity and **~0.15** token overlap. Only the margin above that is real.
+
+Full results, method and failure analysis: see the experiment report.

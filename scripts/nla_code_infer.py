@@ -66,9 +66,13 @@ def main():
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--code", help="function source as a string")
     src.add_argument("--file", help="path to a .py file")
-    p.add_argument("--actor-ckpt", default=str(PROJ / "checkpoints/code_exp1s"))
+    p.add_argument("--actor-ckpt", default=str(PROJ / "checkpoints/code_exp1s"),
+                   help="local path OR a Hub repo id, e.g. TuHan/tiny-nla")
+    p.add_argument("--subfolder", default=None,
+                   help="folder inside a Hub repo, e.g. code-decoder")
     p.add_argument("--base-model", default="Qwen/Qwen3-8B")
-    p.add_argument("--sidecar", default=str(PROJ / "data/coderec/exp1s_eval.parquet.nla_meta.yaml"))
+    p.add_argument("--sidecar", default=str(PROJ / "data/coderec/exp1s_eval.parquet"),
+                   help="parquet path OR its .nla_meta.yaml; either is accepted")
     p.add_argument("--centre-mean", default=str(PROJ / "data/coderec/exp1s_mean.npy"),
                    help="npy train mean; pass '' if the actor was trained on raw vectors")
     p.add_argument("--layer", type=int, default=None, help="default 2/3 depth")
@@ -85,7 +89,31 @@ def main():
     from nla.training.sidecar import read_sidecar
 
     code = canon(Path(args.file).read_text() if args.file else args.code)
-    tk = read_sidecar(args.sidecar)["tokens"]
+
+    # When --actor-ckpt is a Hub repo, pull the sidecar and centring mean from
+    # the same folder rather than requiring local copies. A centred actor is
+    # unusable without its mean, so this must not be left to the caller.
+    if args.subfolder and not Path(args.sidecar).exists():
+        from huggingface_hub import hf_hub_download
+        dl = hf_hub_download(args.actor_ckpt, f"{args.subfolder}/nla_meta.yaml")
+        # give it the name read_sidecar expects: <stem>.nla_meta.yaml
+        stem = Path(dl).with_name("hub_ckpt")
+        Path(str(stem) + ".nla_meta.yaml").write_text(Path(dl).read_text())
+        args.sidecar = str(stem)
+        try:
+            args.centre_mean = hf_hub_download(args.actor_ckpt, f"{args.subfolder}/centre_mean.npy")
+        except Exception:
+            print("note: no centre_mean.npy in the repo — treating actor as raw-vector")
+            args.centre_mean = ""
+    # read_sidecar() appends .nla_meta.yaml itself and returns {} when the file
+    # is missing -- a silent empty dict that only surfaces as a KeyError later.
+    # Accept either form and fail loudly here instead.
+    sc_path = re.sub(r"\.nla_meta\.yaml$", "", str(args.sidecar))
+    sc = read_sidecar(sc_path)
+    if not sc.get("tokens"):
+        sys.exit(f"no injection metadata found for --sidecar {args.sidecar}\n"
+                 f"  (looked for {sc_path}.nla_meta.yaml)")
+    tk = sc["tokens"]
     inj, L, R = tk["injection_token_id"], tk["injection_left_neighbor_id"], tk["injection_right_neighbor_id"]
     inj_char = tk["injection_char"]
 
@@ -115,8 +143,10 @@ def main():
     torch.cuda.empty_cache()
 
     # ---- decode: inject into the trained code actor --------------------------
+    kw = {"subfolder": args.subfolder} if args.subfolder else {}
     actor = AutoModelForCausalLM.from_pretrained(
-        args.actor_ckpt, torch_dtype=torch.bfloat16, device_map={"": args.device}).eval()
+        args.actor_ckpt, torch_dtype=torch.bfloat16,
+        device_map={"": args.device}, **kw).eval()
     embed = actor.get_input_embeddings()
 
     def generate(vec):
