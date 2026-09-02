@@ -475,7 +475,42 @@ hf auth login          # the repo is private — you need access
 ```
 
 Everything below downloads weights on first run (~16 GB per model, cached
-afterwards) and needs one GPU with ≥40 GB.
+afterwards) and needs one GPU with ≥24 GB. The two models are loaded and
+freed in sequence, never both at once, so 24 GB is enough despite 2×16 GB of
+downloads.
+
+### The one command you need
+
+`nla_demo.py` is the entry point. You choose the mode; it chooses the
+checkpoint, always the current one on the Hub, with no flag to pin an older
+one. It needs nothing from this repo, so you can also run it straight from the
+Hub:
+
+```bash
+hf download TuHan/tiny-nla nla_demo.py --local-dir .
+
+python nla_demo.py --mode code 'def gcd(a, b):
+    while b: a, b = b, a % b
+    return a'
+
+python nla_demo.py --mode text 'The Federal Reserve announced yesterday that it
+would raise interest rates, citing persistent inflation'
+```
+
+`--mode code` reconstructs a Python function; `--mode text` explains the
+activation. The mode is explicit rather than sniffed from the input, because
+guessing is wrong in both directions — a bare string literal is valid Python
+but is not code, and a snippet with a typo is code but does not parse.
+`--mode code` rejects input that is not valid Python instead of silently
+falling back.
+
+Add `--control` in either mode to also generate from a random vector. That is
+the comparison that makes an output meaningful: it shows what the decoder's
+prior produces with no information at all. Use `--file mymodule.py` for input
+from a file.
+
+The sections below are the same two paths with all the plumbing exposed — use
+them if you want to point at a specific local checkpoint.
 
 ### Reconstruct a Python function from its activation vector
 

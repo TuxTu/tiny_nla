@@ -5,20 +5,19 @@
     hf auth login
     hf download TuHan/tiny-nla nla_demo.py --local-dir .
 
-    python nla_demo.py 'def gcd(a, b):
+    python nla_demo.py --mode code 'def gcd(a, b):
         while b: a, b = b, a % b
         return a'                              # -> reconstructs the function
 
-    python nla_demo.py 'The Federal Reserve announced yesterday that it would'
+    python nla_demo.py --mode text 'The Federal Reserve announced yesterday'
                                                # -> explains the activation
 
-    python nla_demo.py --file mymodule.py --control
+    python nla_demo.py --mode code --file mymodule.py --control
 
 Compresses the input to ONE 4096-float activation vector from a frozen
-Qwen3-8B, then asks a trained decoder to write it back out. Valid Python is
-routed to the code decoder; anything else to the text explainer. The model is
-always whatever currently sits at the pinned Hub paths -- there is no flag to
-pick an older one.
+Qwen3-8B, then asks a trained decoder to write it back out. YOU pick the mode;
+the CHECKPOINT is chosen for you -- always whatever currently sits at the
+pinned Hub paths, with no flag to select an older one.
 
 Needs one GPU with >=24 GB. Models load sequentially, not together.
 """
@@ -31,6 +30,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 REPO = "TuHan/tiny-nla"
 CODE_SUB, TEXT_SUB = "code-decoder", "nla/actor"
 BASE = "Qwen/Qwen3-8B"
+# Verified per mode -- do not "unify" these without rerunning tmp/prompt_ab.sh.
+PROMPT_MODE = {"code": "minimal", "text": "sidecar"}
 CODE_RE = re.compile(r"<code>\s*(.*?)\s*</code>", re.DOTALL)
 EXPL_RE = re.compile(r"<explanation>\s*(.*?)\s*</explanation>", re.DOTALL)
 STOP = set(keyword.kwlist) | set(dir(builtins)) | {"self", "cls"}
@@ -57,12 +58,9 @@ def normalize_activation(v, scale):
     return v / (v.float().norm(dim=-1, keepdim=True).clamp_min(1e-12) / scale).to(v.dtype)
 
 
-def is_python(s):
-    """Route by trying to parse. A bare sentence is not valid Python."""
+def parses(s):
     try:
-        t = ast.parse(s)
-        return bool(t.body) and not (len(t.body) == 1 and isinstance(t.body[0], ast.Expr)
-                                     and isinstance(getattr(t.body[0], "value", None), ast.Constant))
+        ast.parse(s); return True
     except SyntaxError:
         return False
 
@@ -78,6 +76,10 @@ def idents(src):
 
 def main():
     p = argparse.ArgumentParser(description="tiny_nla demo — compress to one vector, decode it back")
+    p.add_argument("--prompt", choices=["minimal", "sidecar"], default=None,
+                   help="override the injection prompt (diagnostic; default is per-mode verified)")
+    p.add_argument("--mode", required=True, choices=["code", "text"],
+                   help="code = reconstruct a Python function; text = explain the activation")
     p.add_argument("input", nargs="?", help="Python function, or any text")
     p.add_argument("--file", help="read the input from a file instead")
     p.add_argument("--control", action="store_true",
@@ -89,13 +91,17 @@ def main():
         p.error("give some input, or --file")
     raw = Path(a.file).read_text() if a.file else a.input
 
-    code_mode = is_python(raw)
+    code_mode = a.mode == "code"
     if code_mode:
+        if not parses(raw):
+            sys.exit("--mode code needs valid Python; use --mode text for prose")
         raw = ast.unparse(ast.parse(raw))          # canonicalise so formatting is not counted
     sub = CODE_SUB if code_mode else TEXT_SUB
-    print(f"mode: {'CODE reconstruction' if code_mode else 'TEXT explanation'}   ({REPO}/{sub})")
+    print(f"mode: {'CODE reconstruction' if code_mode else 'TEXT explanation'}   "
+          f"(checkpoint chosen automatically: {REPO}/{sub})")
 
-    meta = yaml.safe_load(open(hf_hub_download(REPO, f"{sub}/nla_meta.yaml")))["tokens"]
+    sc = yaml.safe_load(open(hf_hub_download(REPO, f"{sub}/nla_meta.yaml")))
+    meta = sc["tokens"]
     inj, L, R, ch = (meta["injection_token_id"], meta["injection_left_neighbor_id"],
                      meta["injection_right_neighbor_id"], meta["injection_char"])
     try:      # a centred decoder given a raw vector yields fluent, unrelated output
@@ -129,9 +135,16 @@ def main():
         REPO, subfolder=sub, torch_dtype=torch.bfloat16, device_map={"": a.device}).eval()
     embed = actor.get_input_embeddings()
 
+    # Which prompt a checkpoint wants is a property of how it was TRAINED, and the
+    # sidecar's prompt_templates is a dataset-builder default that does not always
+    # match. Both were measured; see PROMPT_MODE.
+    want = a.prompt or PROMPT_MODE[a.mode]
+    tmpl = (sc.get("prompt_templates") or {}).get("actor") if want == "sidecar" else None
+    user_msg = tmpl.replace("{injection_char}", ch) if tmpl else f"<concept>{ch}</concept>"
+
     def gen(vec):
         bv = normalize_activation(torch.tensor(vec).unsqueeze(0), 300.0).to(a.device)
-        s = tok.apply_chat_template([{"role": "user", "content": f"<concept>{ch}</concept>"}],
+        s = tok.apply_chat_template([{"role": "user", "content": user_msg}],
                                     tokenize=False, add_generation_prompt=True)
         enc = tok(s, return_tensors="pt", add_special_tokens=False)
         i2, m2 = enc["input_ids"].to(a.device), enc["attention_mask"].to(a.device)
@@ -155,7 +168,7 @@ def main():
     if code_mode and pred:
         pu, cu = idents(pred), idents(raw)
         sk = difflib.SequenceMatcher(None,
-                                     [type(n).__name__ for n in ast.walk(ast.parse(pred))] if is_python(pred) else [],
+                                     [type(n).__name__ for n in ast.walk(ast.parse(pred))] if parses(pred) else [],
                                      [type(n).__name__ for n in ast.walk(ast.parse(raw))]).ratio()
         print(bar)
         print(f"exact match       : {pred.strip() == raw.strip()}")
