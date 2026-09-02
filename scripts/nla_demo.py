@@ -3,7 +3,7 @@
 
     pip install torch transformers accelerate huggingface_hub numpy pyyaml
     hf auth login
-    hf download TuHan/tiny-nla nla_demo.py --local-dir .
+    hf download ASSERT-KTH/tiny-nla nla_demo.py --local-dir .
 
     python nla_demo.py --mode code 'def gcd(a, b):
         while b: a, b = b, a % b
@@ -38,7 +38,7 @@ import numpy as np, torch, transformers, yaml
 from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-REPO = "TuHan/tiny-nla"
+REPO = "ASSERT-KTH/tiny-nla"
 CODE_SUB, TEXT_SUB = "code-decoder", "nla/actor"
 BASE = "Qwen/Qwen3-8B"
 # Verified per mode by A/B (job 17444219) -- do NOT "unify" these.

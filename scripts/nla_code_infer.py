@@ -67,7 +67,7 @@ def main():
     src.add_argument("--code", help="function source as a string")
     src.add_argument("--file", help="path to a .py file")
     p.add_argument("--actor-ckpt", default=str(PROJ / "checkpoints/code_exp1s"),
-                   help="local path OR a Hub repo id, e.g. TuHan/tiny-nla")
+                   help="local path OR a Hub repo id, e.g. ASSERT-KTH/tiny-nla")
     p.add_argument("--subfolder", default=None,
                    help="folder inside a Hub repo, e.g. code-decoder")
     p.add_argument("--base-model", default="Qwen/Qwen3-8B")

@@ -3,7 +3,7 @@
 
     pip install torch transformers huggingface_hub numpy pyyaml
     hf auth login
-    hf download TuHan/tiny-nla nla_code_demo.py --local-dir .
+    hf download ASSERT-KTH/tiny-nla nla_code_demo.py --local-dir .
     python nla_code_demo.py --code 'def is_palindrome(s):
         s = s.lower()
         return s == s[::-1]'
@@ -91,7 +91,7 @@ def main():
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--code", help="function source")
     g.add_argument("--file", help="path to a .py file")
-    p.add_argument("--repo", default="TuHan/tiny-nla")
+    p.add_argument("--repo", default="ASSERT-KTH/tiny-nla")
     p.add_argument("--subfolder", default="code-decoder")
     p.add_argument("--base-model", default="Qwen/Qwen3-8B")
     p.add_argument("--injection-scale", type=float, default=300.0)

@@ -589,7 +589,7 @@ Weights live on the Hub, code lives here. You need both.
 ```bash
 git clone git@github.com:TuxTu/tiny_nla.git && cd tiny_nla
 pip install torch transformers accelerate huggingface_hub pyarrow numpy pyyaml
-hf auth login          # the repo is private — you need access
+# no login needed — the models are public under ASSERT-KTH
 ```
 
 Everything below downloads weights on first run (~16 GB per model, cached
@@ -605,7 +605,7 @@ one. It needs nothing from this repo, so you can also run it straight from the
 Hub:
 
 ```bash
-hf download TuHan/tiny-nla nla_demo.py --local-dir .
+hf download ASSERT-KTH/tiny-nla nla_demo.py --local-dir .
 
 python nla_demo.py --mode code 'def gcd(a, b):
     while b: a, b = b, a % b
@@ -645,7 +645,7 @@ them if you want to point at a specific local checkpoint.
 
 ```bash
 python scripts/nla_code_infer.py \
-    --actor-ckpt TuHan/tiny-nla --subfolder code-decoder \
+    --actor-ckpt ASSERT-KTH/tiny-nla --subfolder code-decoder \
     --code 'def gcd(a, b):
     while b:
         a, b = (b, a % b)
@@ -677,8 +677,8 @@ same signature, same parameters, wrong entity.
 
 ```bash
 python scripts/nla_infer.py \
-    --actor-ckpt TuHan/tiny-nla --actor-subfolder nla/actor \
-    --critic-ckpt TuHan/tiny-nla --critic-subfolder nla/critic \
+    --actor-ckpt ASSERT-KTH/tiny-nla --actor-subfolder nla/actor \
+    --critic-ckpt ASSERT-KTH/tiny-nla --critic-subfolder nla/critic \
     --text "The Federal Reserve announced yesterday that it would raise rates"
 ```
 
@@ -688,7 +688,7 @@ a vector; FVE scores the round trip. Gold-explanation ceiling is +0.6165.
 ### What is in the Hub repo
 
 ```
-TuHan/tiny-nla
+ASSERT-KTH/tiny-nla
   nla/actor/         text actor, 3 epochs on 124,741 rows, conditioning gap +0.4593
   nla/critic/        critic, 65.7% held-out FVE
   code-decoder/      code reconstruction  + centre_mean.npy  + nla_meta.yaml
