@@ -470,7 +470,7 @@ Weights live on the Hub, code lives here. You need both.
 
 ```bash
 git clone git@github.com:TuxTu/tiny_nla.git && cd tiny_nla
-pip install torch transformers huggingface_hub pyarrow numpy pyyaml
+pip install torch transformers accelerate huggingface_hub pyarrow numpy pyyaml
 hf auth login          # the repo is private — you need access
 ```
 

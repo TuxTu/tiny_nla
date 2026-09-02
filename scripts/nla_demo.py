@@ -30,8 +30,20 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 REPO = "TuHan/tiny-nla"
 CODE_SUB, TEXT_SUB = "code-decoder", "nla/actor"
 BASE = "Qwen/Qwen3-8B"
-# Verified per mode -- do not "unify" these without rerunning tmp/prompt_ab.sh.
+# Verified per mode by A/B (job 17444219) -- do NOT "unify" these.
+#   text + minimal  -> emits <answer>, drifts off-topic (regex misses, raw falls through)
+#   code + sidecar  -> ident recall 0.00: writes a function ABOUT activation vectors,
+#                      following the preamble's subject instead of the injected vector
+#   the winners     -> code 1.00 recall / AST 0.862 ; text = correct 2-3 snippet format
+# Each checkpoint wants the prompt IT was trained on. code-decoder's sidecar
+# prompt_templates is a stale dataset-builder default and does not record that.
 PROMPT_MODE = {"code": "minimal", "text": "sidecar"}
+
+# transformers 5.x renamed torch_dtype -> dtype and warns on the old name; 4.x
+# does not know the new one. An unpinned `pip install transformers` gets 5.x.
+_DT = ({"dtype": torch.bfloat16}
+       if int(transformers.__version__.split(".")[0]) >= 5
+       else {"torch_dtype": torch.bfloat16})
 CODE_RE = re.compile(r"<code>\s*(.*?)\s*</code>", re.DOTALL)
 EXPL_RE = re.compile(r"<explanation>\s*(.*?)\s*</explanation>", re.DOTALL)
 STOP = set(keyword.kwlist) | set(dir(builtins)) | {"self", "cls"}
@@ -100,7 +112,14 @@ def main():
     print(f"mode: {'CODE reconstruction' if code_mode else 'TEXT explanation'}   "
           f"(checkpoint chosen automatically: {REPO}/{sub})")
 
-    sc = yaml.safe_load(open(hf_hub_download(REPO, f"{sub}/nla_meta.yaml")))
+    try:
+        sc = yaml.safe_load(open(hf_hub_download(REPO, f"{sub}/nla_meta.yaml")))
+    except Exception as e:
+        if "401" in str(e) or "Repository Not Found" in str(e):
+            sys.exit(f"cannot read {REPO}: it is private and this machine is not "
+                     f"authenticated.\n  run:  hf auth login\n"
+                     f"  then ask the repo owner to grant your HF account access.")
+        raise
     meta = sc["tokens"]
     inj, L, R, ch = (meta["injection_token_id"], meta["injection_left_neighbor_id"],
                      meta["injection_right_neighbor_id"], meta["injection_char"])
@@ -114,7 +133,7 @@ def main():
         tok.pad_token_id = tok.eos_token_id
 
     base = AutoModelForCausalLM.from_pretrained(
-        BASE, torch_dtype=torch.bfloat16, device_map={"": a.device}).eval()
+        BASE, **_DT, device_map={"": a.device}).eval()
     layer = (2 * len(base.model.layers)) // 3
     cap = {}
     h = base.model.layers[layer].register_forward_hook(
@@ -132,7 +151,7 @@ def main():
     del base; torch.cuda.empty_cache()
 
     actor = AutoModelForCausalLM.from_pretrained(
-        REPO, subfolder=sub, torch_dtype=torch.bfloat16, device_map={"": a.device}).eval()
+        REPO, subfolder=sub, **_DT, device_map={"": a.device}).eval()
     embed = actor.get_input_embeddings()
 
     # Which prompt a checkpoint wants is a property of how it was TRAINED, and the
