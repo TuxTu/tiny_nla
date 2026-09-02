@@ -70,6 +70,26 @@ def normalize_activation(v, scale):
     return v / (v.float().norm(dim=-1, keepdim=True).clamp_min(1e-12) / scale).to(v.dtype)
 
 
+def scratch_dir():
+    """A writable scratch directory that is never /tmp.
+
+    /tmp is off limits on this cluster and is node-local anyway, but both
+    tempfile and triton default there. Honour an explicit TMPDIR when it does
+    not point into /tmp, else fall back to the user's cache dir.
+    """
+    for cand in (os.environ.get("TMPDIR"), os.environ.get("XDG_CACHE_HOME")):
+        if cand and not os.path.realpath(cand).startswith("/tmp"):
+            d = os.path.join(cand, "tiny_nla")
+            try:
+                os.makedirs(d, exist_ok=True)
+                return d
+            except OSError:
+                pass
+    d = os.path.join(os.path.expanduser("~"), ".cache", "tiny_nla")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def ensure_compiler():
     """Pick a C compiler that actually works, before torch needs one.
 
@@ -82,7 +102,7 @@ def ensure_compiler():
     """
     if os.environ.get("CC"):
         return
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=scratch_dir()) as d:
         src = os.path.join(d, "probe.c")
         with open(src, "w") as f:
             f.write("int main(){return 0;}")
@@ -138,6 +158,12 @@ def main():
         if not parses(raw):
             sys.exit("--mode code needs valid Python; use --mode text for prose")
         raw = ast.unparse(ast.parse(raw))          # canonicalise so formatting is not counted
+    # Keep triton's JIT scratch and every tempfile default off /tmp.
+    _sd = scratch_dir()
+    if os.path.realpath(os.environ.get("TMPDIR", "/tmp")).startswith("/tmp"):
+        os.environ["TMPDIR"] = _sd
+    tempfile.tempdir = _sd
+    os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_sd, "triton"))
     ensure_compiler()
     sub = CODE_SUB if code_mode else TEXT_SUB
     print(f"mode: {'CODE reconstruction' if code_mode else 'TEXT explanation'}   "

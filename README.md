@@ -513,8 +513,12 @@ from a file.
 startup and exports `CC` itself, because triton JIT-compiles a CUDA helper on
 first GPU use and the `gcc` first on PATH here is a wrapper that refuses
 without a build-env module. If you see a `CalledProcessError` naming a
-`cuda_utils.c` you never wrote, set `CC=/usr/bin/gcc` by hand. Nothing needs to
-go in `/tmp`.
+`cuda_utils.c` you never wrote, set `CC=/usr/bin/gcc` by hand.
+
+The demo never writes to `/tmp`: it redirects `TMPDIR`, `TRITON_CACHE_DIR` and
+Python's own `tempfile` default into `$TMPDIR` (when you set one outside
+`/tmp`) or `~/.cache/tiny_nla`. Set `TMPDIR` to a project path if your site
+requires it.
 
 The sections below are the same two paths with all the plumbing exposed — use
 them if you want to point at a specific local checkpoint.
