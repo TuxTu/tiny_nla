@@ -41,14 +41,27 @@ class NLACriticModel(PreTrainedModel):
     residual stream goes to value head. Identity-initialized.
     """
 
-    def __init__(self, config, backbone: PreTrainedModel):
+    def __init__(self, config, backbone: PreTrainedModel, value_head_depth: int = 1):
         super().__init__(config)
         self.backbone = backbone
-        self.value_head = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        d = config.hidden_size
+        if value_head_depth <= 1:
+            self.value_head = nn.Linear(d, d, bias=False)
+        else:
+            layers = []
+            for i in range(value_head_depth):
+                in_d = d if i == 0 else d
+                out_d = d
+                bias = (i < value_head_depth - 1)  # bias on hidden, not final
+                layers.append(nn.Linear(in_d, out_d, bias=bias))
+                if i < value_head_depth - 1:
+                    layers.append(nn.GELU())
+            self.value_head = nn.Sequential(*layers)
+        self._value_head_depth = value_head_depth
         self._no_split_modules = getattr(backbone, "_no_split_modules", [])
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *, nla_num_layers: int | None = None, **kwargs):
+    def from_pretrained(cls, pretrained_model_name_or_path, *, nla_num_layers: int | None = None, value_head_depth: int = 1, **kwargs):
         """Load with truncation to nla_num_layers + 1 transformer blocks."""
         kwargs.setdefault("trust_remote_code", True)
         config = AutoConfig.from_pretrained(
@@ -78,14 +91,25 @@ class NLACriticModel(PreTrainedModel):
 
         model = cls(config, backbone)
 
-        # Load saved value_head weights if resuming from checkpoint, else identity-init
+        # Load saved value_head weights if resuming from checkpoint.
+        # Default: default Linear init (kaiming uniform), matching original repo.
+        # Identity init is optional via value_head_init="identity" kwarg (our
+        # earlier experiments used this; original does not).
         head_path = Path(pretrained_model_name_or_path) / "value_head.safetensors"
         if head_path.exists():
             from safetensors.torch import load_file
-            model.value_head.load_state_dict(load_file(str(head_path)))
-        else:
+            model.value_head.load_state_dict(load_file(str(head_path)), strict=False)
+        elif kwargs.pop("value_head_init", None) == "identity":
             with torch.no_grad():
-                model.value_head.weight.copy_(torch.eye(config.hidden_size))
+                if isinstance(model.value_head, nn.Linear):
+                    model.value_head.weight.copy_(torch.eye(config.hidden_size))
+                else:
+                    last_linear = None
+                    for m in model.value_head:
+                        if isinstance(m, nn.Linear):
+                            last_linear = m
+                    if last_linear is not None:
+                        last_linear.weight.copy_(torch.eye(config.hidden_size))
 
         # Ensure value_head is on the same device AND dtype as the backbone.
         # When using device_map, backbone params are auto-placed but value_head

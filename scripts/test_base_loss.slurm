@@ -13,6 +13,7 @@ CONDA_ENV=/home/x_tuhan/.conda/envs/tiny_nla
 export PATH="$CONDA_ENV/bin:$PATH"
 export LD_LIBRARY_PATH="$CONDA_ENV/lib:$LD_LIBRARY_PATH"
 export HF_HOME=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla/cache/huggingface
+export TORCHINDUCTOR_CACHE_DIR=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla/cache/torchinductor   # else torch defaults to /tmp/torchinductor_$USER
 mkdir -p "$HF_HOME"
 PROJ=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla
 
@@ -21,7 +22,7 @@ PROJ=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla
 echo "=== Critic ==="
 python -m nla.training.train_critic_sft \
     --data "$PROJ/data/ar_sft_train.parquet" \
-    --model-name Qwen/Qwen3-4B --output-dir /tmp/base_critic \
+    --model-name Qwen/Qwen3-4B --output-dir $PROJ/tmp/base_critic \
     --micro-batch-size 8 --global-batch-size 64 \
     --lr 2e-5 --num-steps 1 --max-length 512 --save-every 100 2>&1 | grep "loss"
 
@@ -29,7 +30,7 @@ python -m nla.training.train_critic_sft \
 echo "=== Actor ==="
 python -m nla.training.train_actor_sft \
     --data "$PROJ/data/av_sft_train.parquet" \
-    --model-name Qwen/Qwen3-4B --output-dir /tmp/base_actor \
+    --model-name Qwen/Qwen3-4B --output-dir $PROJ/tmp/base_actor \
     --micro-batch-size 4 --global-batch-size 32 \
     --lr 2e-5 --num-steps 1 --max-length 2048 --save-every 100 2>&1 | grep "loss"
 

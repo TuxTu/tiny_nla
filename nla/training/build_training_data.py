@@ -7,6 +7,7 @@ plus sidecar YAML with full token metadata.
 import argparse
 import sys
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from transformers import AutoTokenizer
@@ -69,20 +70,54 @@ def build(
     expl = pq.read_table(resolve_parquet(explained_path))
     vecs = pq.read_table(resolve_parquet(vectors_path))
 
-    # Verify join keys match
-    expl_keys = set(
+    # ---- JOIN on (doc_id, n_raw_tokens) --------------------------------------
+    # This MUST be a real join, not a set-equality check followed by positional
+    # concatenation. extract_vectors.py emits rows in sorted(doc_id) order --
+    # a STRING sort, so "...:100" precedes "...:2" -- while the explained parquet
+    # is in corpus order. Comparing only the key SETS passes while 99.96% of rows
+    # end up pairing an explanation with some other position's activation vector,
+    # which caps the critic at predict-the-mean (FVE ~ 0) no matter how well it
+    # trains.
+    expl_keys = list(
         zip(expl.column("doc_id").to_pylist(), expl.column("n_raw_tokens").to_pylist())
     )
-    vec_keys = set(
+    vec_keys = list(
         zip(vecs.column("doc_id").to_pylist(), vecs.column("n_raw_tokens").to_pylist())
     )
-    missing = expl_keys - vec_keys
-    extra = vec_keys - expl_keys
+    missing = set(expl_keys) - set(vec_keys)
+    extra = set(vec_keys) - set(expl_keys)
     assert not missing, f"{len(missing)} rows in explained missing from vectors"
     assert not extra, f"{len(extra)} rows in vectors not in explained"
+    assert len(set(vec_keys)) == len(vec_keys), (
+        f"vectors parquet has {len(vec_keys) - len(set(vec_keys))} duplicate "
+        f"(doc_id, n_raw_tokens) keys -- join would be ambiguous"
+    )
+
+    vec_pos = {k: i for i, k in enumerate(vec_keys)}
+    order = np.fromiter((vec_pos[k] for k in expl_keys), dtype=np.int64,
+                        count=len(expl_keys))
+    n_already_aligned = int((order == np.arange(len(order))).sum())
+    print(f"join: reordering vectors to explained order "
+          f"({n_already_aligned}/{len(order)} rows were already positionally aligned)")
 
     if d_model is None:
-        d_model = len(vecs.column(ACTIVATION_COLUMN)[0].as_py())
+        d_model = vecs.column(ACTIVATION_COLUMN).combine_chunks().type.list_size
+
+    # Reorder through numpy rather than ChunkedArray.take(): the values buffer is
+    # ~4 GiB at 250k x 4096 fp32, right at arrow's uint32 byte-offset limit.
+    _flat = vecs.column(ACTIVATION_COLUMN).combine_chunks()
+    _V = _flat.values.to_numpy().reshape(-1, d_model)[order]
+    activation_col = pa.FixedSizeListArray.from_arrays(
+        pa.array(_V.reshape(-1), type=pa.float32()), d_model
+    )
+    del _flat, _V
+
+    # Post-join verification: the reordered vector keys must now match row-for-row.
+    joined_vec_keys = [vec_keys[i] for i in order]
+    assert joined_vec_keys == expl_keys, (
+        "join failed: vector keys still do not match explained keys row-for-row"
+    )
+    print(f"join verified: {len(order)} rows aligned on (doc_id, n_raw_tokens)")
     print(f"d_model={d_model}  rows={expl.num_rows}  split_type={split_type}")
 
     # ---- token metadata ------------------------------------------------------
@@ -114,7 +149,7 @@ def build(
         table_dict = {
             "prompt": prompt_col,
             "response": response_col,
-            ACTIVATION_COLUMN: vecs.column(ACTIVATION_COLUMN),
+            ACTIVATION_COLUMN: activation_col,
         }
 
     elif split_type == "ar_sft":
@@ -123,13 +158,13 @@ def build(
         _validate_ar_sft_tail(prompts, token_meta.critic_suffix_ids, tokenizer)
         table_dict = {
             "prompt": pa.array(prompts, type=pa.string()),
-            ACTIVATION_COLUMN: vecs.column(ACTIVATION_COLUMN),
+            ACTIVATION_COLUMN: activation_col,
         }
 
     elif split_type == "rl":
         table_dict = {
             "prompt": prompt_col,
-            ACTIVATION_COLUMN: vecs.column(ACTIVATION_COLUMN),
+            ACTIVATION_COLUMN: activation_col,
         }
 
     else:

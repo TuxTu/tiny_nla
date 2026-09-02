@@ -1,0 +1,50 @@
+# Pipeline config — Qwen3-8B over Ultra-FineWeb (100k docs, full scale).
+# ~1M activation vectors (100k docs × 10 positions), split 25/50/25.
+# Matches original repo data scale with Ultra-FineWeb's higher-quality text.
+#
+# Stages: extract → explain → output → vectors
+#   - extract: tokenize ~100k docs, sample 10 positions each
+#   - explain: DeepSeek v4 Flash labels each position
+#   - output:  build model-specific parquets (explained only, no vectors yet)
+#   - vectors: Qwen3-8B forward pass → extract 4096-dim activation vectors
+#
+# Final output: av_sft_explained_vectors.parquet, ar_sft_explained_vectors.parquet, rl_vectors.parquet
+#
+# Run: python -m nla.datagen.run_pipeline --config configs/datagen_8b_ultrafineweb_100k.yaml
+#   or: python -m nla.datagen.run_pipeline --config configs/datagen_8b_ultrafineweb_100k.yaml --stages extract,explain,output  # CPU only
+#   or: python -m nla.datagen.run_pipeline --config configs/datagen_8b_ultrafineweb_100k.yaml --stages vectors               # GPU only
+
+tokenizer_name: Qwen/Qwen3-8B          # any Qwen3 model — same tokenizer family
+
+corpus:
+  name: openbmb/Ultra-FineWeb
+  config: null
+  split: en
+
+text_column: content                 # cols = [content, score]
+
+positions_per_doc: 10
+min_position: 50
+max_length: 2048
+seed: 42
+
+pool_dir: data/pool_ufw_8b             # shared pool — grows across runs
+output_dir: data/ufw_8b                # model-specific output
+
+num_docs: 100000                       # 100k docs → ~1M positions (matches original scale)
+
+model_name: Qwen/Qwen3-8B             # for vector extraction
+batch_size: 16
+
+split:
+  av_sft: 0.25
+  ar_sft: 0.50                        # give AR half the data (matching our goal)
+  rl: 0.25
+
+provider:
+  name: deepseek
+  model: deepseek-v4-flash
+  max_tokens: 400
+  concurrency: 64                      # DeepSeek can handle high concurrency
+
+storage_cls: nla.datagen.storage.LocalStorage

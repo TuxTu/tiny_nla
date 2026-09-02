@@ -8,4 +8,10 @@ checkpoints/
 data/
 tmp/
 .agents/
+
+# local session / editor state
 .claude/
+.nvimlog
+.split50_jobs
+# data is a symlink to a backup volume on this cluster
+data

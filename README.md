@@ -412,6 +412,302 @@ scripts/
 configs/                 YAML pipeline configs
 ```
 
+## Qwen3-8B results
+
+Scaling the pipeline to Qwen3-8B (36 layers, d_model=4096, extraction layer 24)
+on 100k UltraFineWeb documents. Both models train on **document-disjoint** halves
+of the labeled pool, so no document seen by the critic is seen by the actor.
+
+| Setting | Value |
+|---------|-------|
+| Base model | Qwen3-8B (36 layers, d_model=4096) |
+| Critic | 25 layers (2/3 truncated) + value_head, identity-init |
+| Injection | char `㈎`, scale 300 (mean vector L2 = 266) |
+| AV pool | 124,741 pairs / 12,500 docs (10 positions per doc) |
+| Actor SFT | 1,461 steps (3 epochs), global_batch=256, 4×A100 FSDP, fp32 master weights |
+| Critic SFT | 487 steps (1 epoch), global_batch=256, 4×A100 |
+
+| Metric | Actor (AV) | Critic (AR) |
+|--------|-----------|------------|
+| Final held-out CE | 1.3305 | — |
+| Final held-out MSE | — | 0.2405 |
+| **FVE_nrm_meannorm** | — | **+62.93%** |
+| **FVE_nrm** | — | **+55.75%** |
+| **Real-vs-shuffled gap** | **+0.4593** | — |
+
+Both directions work at 8B. The critic beats the mean predictor by a wide margin
+(the 4B critic could not, see above), and the actor genuinely conditions on the
+injected vector.
+
+### The loss mask is not optional
+
+The actor initially appeared completely broken — a real-vs-shuffled gap of
+**+0.0013**, i.e. swapping in a *different* vector cost the model nothing. Three
+plausible-sounding explanations were wrong: data volume (a 1k→8k→64k→125k ladder
+showed the gap still climbing at full data), positions-per-doc (Anthropic's
+`qwen7b_ultrafineweb_100k.yaml` uses 10, the same as ours), and injection scale
+(a 300-vs-160 A/B came back null — but that A/B ran for only 150 steps, too few
+for the vector channel to exist at all, so it could not have detected a scale
+effect; see *Injection scale* below for the corrected measurement).
+
+The actual cause was `sft_loss()` being called **without a loss mask**, averaging
+cross-entropy over prompt + response + padding instead of the response alone.
+Padding was not even marked `-100`, so `pad == eos` was scored as a real target.
+This halved the reported CE, which made the loss curve look converged when it was
+not — so every run was also stopped far too early.
+
+Both fixes were required; neither alone sufficed:
+
+| loss | steps | real-vs-shuffled gap |
+|------|-------|---------------------|
+| unmasked | 487 | +0.0013 |
+| unmasked | 300 | +0.0054 |
+| masked | 150 | +0.0027 |
+| masked | 300 | +0.1462 |
+| **masked** | **1,461** | **+0.4593** |
+
+The two arms at 300 steps differ *only* in the loss mask (`--legacy-unmasked-loss`
+reproduces the old objective on demand) — a 27× difference from one line.
+
+The injection-scale A/B deserves a caveat: it was run at 150 steps, which we now
+know is too few for the vector channel to exist at all, so it could not have
+detected a scale effect either way. Measured properly on the converged checkpoint,
+scale *does* matter, though moderately — the same checkpoint ablated at its training
+scale of 300 gives **+0.4612**, and at 160 gives **+0.4048**, a 12% loss. (An earlier
+version of this README claimed layer-0 RMSNorm makes scale irrelevant. That is wrong:
+RMSNorm normalizes the *attention* input, but the residual stream adds the raw
+embedding back un-normalized, so magnitude propagates.) `--injection-scale` is
+therefore required rather than defaulted in both `train_actor_sft.py` and
+`train_rl.py`.
+
+**Watch the ablation gap, not the eval CE.** Held-out CE plateaued at ~1.331 from
+step 1000 onward while the ablation gap kept improving; trusting the CE curve would
+have stopped training three checkpoints early. This matches the reference
+implementation's own note: *"real-vs-rand gap is the signal, not train loss."*
+
+### Injection scale
+
+Measured on the same checkpoint (`actor_sft_8b_s50fix`, 256 held-out rows), varying
+only the L2 norm the activation vector is rescaled to before replacing the marker
+token's embedding:
+
+| injection scale | real-vs-shuffled gap |
+|---|---|
+| **300** (matches SFT) | **+0.4612** |
+| 160 | +0.4048 |
+
+A ~2x scale error costs about **12%** of the conditioning signal — a real effect,
+but not a dominant one. An earlier claim that layer-0 RMSNorm makes scale
+irrelevant was wrong: RMSNorm normalises the *attention* input, but the residual
+stream adds the raw embedding back un-normalised, so magnitude does propagate.
+
+This matters because RL sidecars carry `injection_scale: null`, and the old
+`2.5 * sqrt(d_model)` fallback silently produced 160 while the actor was SFT'd at
+300. Both `train_actor_sft.py` and `train_rl.py` now **require** `--injection-scale`
+rather than defaulting.
+
+### Generated explanations
+
+`scripts/actor_vector_ablation.py` proves the vector carries information; it says
+nothing about whether the text is any good. `scripts/actor_gen_inspect.py` checks
+the output directly on 500 held-out rows:
+
+| | 4B actor (greedy) | 8B actor (greedy) | 8B actor (sampled) |
+|---|---|---|---|
+| unique explanations / 500 | 25 (5%) | **500 (100%)** | **500 (100%)** |
+| content-word F1 vs own gold | — | 0.3819 | 0.3266 |
+| content-word F1 vs other golds | — | 0.2267 | 0.1932 |
+| retrieval acc (vs 19 distractors) | — | **68.4%** | **69.2%** |
+| `<explanation>` extraction failures | 0% | 1.0% | 2.6% |
+
+Mode collapse is gone. Overlap with the gold explanation is only meaningful
+against a control — any two explanations of any vectors share words like
+"vector"/"text"/"activations" — so each generation is also scored against *other*
+rows' golds. Retrieval accuracy (own gold ranked above 19 random distractors) is
+the more trustworthy metric, since correct paraphrase is lexically divergent and
+token-F1 undercounts it.
+
+A held-out sample. The model sees **only a 4096-dim vector** — never the source text:
+
+```
+GOLD: Immediate semantic expectations: The list format with hyphens and colons
+      establishes a pattern where each line provides a specific statistic, so the
+      next line must continue this structured data presentation.
+      Syntactic/structural constraints: The last line "Nearest airport to White
+      Plains: West" is an incomplete noun phrase; "West" is an adjective starting
+      an airport name, requiring a completion like "Westchester County Airport".
+      Final feature: The final token "West" is the initial word of an airport name.
+
+GEN : Syntactic/structural constraint: The hyphenated list item "Airline: West" is
+      incomplete, requiring a completion of the airline name (e.g., "Westchester
+      County Airport").
+      Immediate semantic expectation: The list format promises specific details for
+      each bullet point, so the next token must continue the "Airline" field with
+      the actual airline name or code.
+      Final feature: The last token "West" is the start of a proper noun (airline
+      name) within a bulleted list item, immediately requiring the remainder of that
+      name to complete the entry.
+```
+
+It recovers the truncation point (`"West"`), the document's list structure, and the
+completion (`Westchester County Airport`) from the vector alone. It misreads the
+field label as "Airline" rather than "Nearest airport" — the kind of error that is
+semantically close but lexically costly, and part of why F1 sits at ~0.38 while the
+retrieval score is 68%.
+
+### Known issues
+
+- **Tag-extraction regression.** The 8B actor drops `<explanation>` tags on 1.0%
+  (greedy) / 2.6% (sampled) of rows; the 4B actor never did. The GRPO reward path
+  parses those tags, so this matters for RL.
+### End-to-end coupling
+
+Actor generates an explanation from a vector; critic reconstructs the vector from
+that text. 500 held-out rows, `critic_sft_8b_s50` + `actor_sft_8b_s50fix`:
+
+| decoding | FVE_nrm_meannorm | FVE_nrm | MSE | extraction failures |
+|---|---|---|---|---|
+| pre-fix actor (greedy) | −0.2793 | — | 0.8675 | 0% |
+| **greedy** | **+0.5207** | +0.4228 | 0.3250 | 0.2% |
+| **sampled T=1.0** | **+0.4581** | +0.3475 | 0.3675 | 1.0% |
+| *gold explanations (ceiling)* | *+0.6165* | *+0.5382* | *0.2601* | — |
+
+The loop closes: actor-generated text retains 84% (greedy) of what gold
+API-written explanations achieve. GRPO rollouts are *sampled*, so +0.4581 — 74% of
+the ceiling — is the baseline RL actually starts from.
+
 ## License
 
 Apache-2.0
+
+---
+
+## Testing the models (for collaborators)
+
+Weights live on the Hub, code lives here. You need both.
+
+```bash
+git clone git@github.com:TuxTu/tiny_nla.git && cd tiny_nla
+pip install torch transformers accelerate huggingface_hub pyarrow numpy pyyaml
+hf auth login          # the repo is private — you need access
+```
+
+Everything below downloads weights on first run (~16 GB per model, cached
+afterwards) and needs one GPU with ≥24 GB. The two models are loaded and
+freed in sequence, never both at once, so 24 GB is enough despite 2×16 GB of
+downloads.
+
+### The one command you need
+
+`nla_demo.py` is the entry point. You choose the mode; it chooses the
+checkpoint, always the current one on the Hub, with no flag to pin an older
+one. It needs nothing from this repo, so you can also run it straight from the
+Hub:
+
+```bash
+hf download TuHan/tiny-nla nla_demo.py --local-dir .
+
+python nla_demo.py --mode code 'def gcd(a, b):
+    while b: a, b = b, a % b
+    return a'
+
+python nla_demo.py --mode text 'The Federal Reserve announced yesterday that it
+would raise interest rates, citing persistent inflation'
+```
+
+`--mode code` reconstructs a Python function; `--mode text` explains the
+activation. The mode is explicit rather than sniffed from the input, because
+guessing is wrong in both directions — a bare string literal is valid Python
+but is not code, and a snippet with a typo is code but does not parse.
+`--mode code` rejects input that is not valid Python instead of silently
+falling back.
+
+Add `--control` in either mode to also generate from a random vector. That is
+the comparison that makes an output meaningful: it shows what the decoder's
+prior produces with no information at all. Use `--file mymodule.py` for input
+from a file.
+
+**On a cluster (NSC/Berzelius).** The demo probes for a working C compiler on
+startup and exports `CC` itself, because triton JIT-compiles a CUDA helper on
+first GPU use and the `gcc` first on PATH here is a wrapper that refuses
+without a build-env module. If you see a `CalledProcessError` naming a
+`cuda_utils.c` you never wrote, set `CC=/usr/bin/gcc` by hand.
+
+The demo never writes to `/tmp`: it redirects `TMPDIR`, `TRITON_CACHE_DIR` and
+Python's own `tempfile` default into `$TMPDIR` (when you set one outside
+`/tmp`) or `~/.cache/tiny_nla`. Set `TMPDIR` to a project path if your site
+requires it.
+
+The sections below are the same two paths with all the plumbing exposed — use
+them if you want to point at a specific local checkpoint.
+
+### Reconstruct a Python function from its activation vector
+
+```bash
+python scripts/nla_code_infer.py \
+    --actor-ckpt TuHan/tiny-nla --subfolder code-decoder \
+    --code 'def gcd(a, b):
+    while b:
+        a, b = (b, a % b)
+    return a'
+```
+
+Prints the original, the reconstruction, and three scores. Add `--control` to
+also generate from a random vector, which shows what the code prior produces
+with no information — the comparison that makes the output meaningful.
+
+Give it a file instead with `--file mymodule.py`.
+
+**What to expect.** This is not a lossless codec. On a 300-function held-out set:
+
+| | |
+|---|---|
+| exact string match | 1.0% |
+| identical modulo renaming | 3.7% |
+| AST-skeleton > 0.9 (near-identical shape) | 7.7% |
+| retrieval@1 — is the output nearest its own target of 300? | **71%** |
+| identifier recall | 17% |
+
+So it reliably tells you *which* function a vector came from, usually gets the
+shape and domain right, and usually gets the specific names wrong. The typical
+error is a **sibling**: ask it for `send_video` and you get `send_document`,
+same signature, same parameters, wrong entity.
+
+### Explain a text activation vector
+
+```bash
+python scripts/nla_infer.py \
+    --actor-ckpt TuHan/tiny-nla --actor-subfolder nla/actor \
+    --critic-ckpt TuHan/tiny-nla --critic-subfolder nla/critic \
+    --text "The Federal Reserve announced yesterday that it would raise rates"
+```
+
+Actor writes an explanation of the vector; critic reads the explanation back to
+a vector; FVE scores the round trip. Gold-explanation ceiling is +0.6165.
+
+### What is in the Hub repo
+
+```
+TuHan/tiny-nla
+  nla/actor/         text actor, 3 epochs on 124,741 rows, conditioning gap +0.4593
+  nla/critic/        critic, 65.7% held-out FVE
+  code-decoder/      code reconstruction  + centre_mean.npy  + nla_meta.yaml
+```
+
+**`code-decoder` requires `centre_mean.npy`.** It was trained on mean-centred
+vectors, and the offset carries ~82% of a typical vector's magnitude — inject a
+raw vector and the model produces fluent, plausible, completely unrelated code.
+`nla_code_infer.py` fetches it automatically when you pass `--subfolder`; if you
+load the weights yourself, subtract it before injecting.
+
+### Reading the numbers
+
+Every metric should be compared against its control, not against zero:
+
+- `--control` / shuffled vector is the floor. For round-trip FVE that floor is
+  about **−0.78**, not 0, so a raw score of 0.14 can still be most of the
+  available signal.
+- Two arbitrary Python functions already share **~0.52** AST-skeleton
+  similarity and **~0.15** token overlap. Only the margin above that is real.
+
+Full results, method and failure analysis: see the experiment report.

@@ -57,6 +57,8 @@ def load_models(
     critic_ckpt: str = DEFAULT_CRITIC_CKPT,
     sidecar_path: str = DEFAULT_SIDECAR,
     device: str = "cuda",
+    actor_subfolder: str | None = None,
+    critic_subfolder: str | None = None,
 ):
     """Load actor and critic models from SFT checkpoints.
 
@@ -73,24 +75,28 @@ def load_models(
     from nla.training.sidecar import read_sidecar
 
     print(f"Loading actor from {actor_ckpt} ...")
+    _asub = {"subfolder": actor_subfolder} if actor_subfolder else {}
     actor = AutoModelForCausalLM.from_pretrained(
         actor_ckpt,
         torch_dtype=torch.bfloat16,
         device_map={"": device},
+        **_asub,
     )
     actor.eval()
 
     print(f"Loading critic from {critic_ckpt} ...")
+    _csub = {"subfolder": critic_subfolder} if critic_subfolder else {}
     critic = NLACriticModel.from_pretrained(
         critic_ckpt,
         torch_dtype=torch.bfloat16,
+        **_csub,
     )
     critic = critic.to(device)
     critic.eval()
 
     # Tokenizer from actor checkpoint (has chat template), fall back to model_name
     try:
-        tokenizer = AutoTokenizer.from_pretrained(actor_ckpt)
+        tokenizer = AutoTokenizer.from_pretrained(actor_ckpt, **_asub)
     except Exception:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token_id is None:
@@ -281,7 +287,13 @@ def nla_translate(
         finally:
             hook.remove()
 
-    full_text = tokenizer.decode(gen_out[0], skip_special_tokens=True)
+    # Decode ONLY the generated continuation. Decoding the full sequence lets
+    # extract_explanation match the literal "<explanation>" that appears in the
+    # PROMPT ("...enclosed within <explanation> tags."), so every "explanation"
+    # came back as ~60 tokens of instruction boilerplate glued to the real one --
+    # and that boilerplate is what the critic scored.
+    gen_ids = gen_out[0][prompt_ids.shape[1]:]
+    full_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
     explanation = extract_explanation(full_text)
 
     result = {
@@ -320,6 +332,10 @@ def main():
                    help=f"HF model ID for tokenizer (default: {DEFAULT_MODEL_NAME})")
     p.add_argument("--actor-ckpt", type=str, default=DEFAULT_ACTOR_CKPT,
                    help=f"Path to actor SFT checkpoint (default: {DEFAULT_ACTOR_CKPT})")
+    p.add_argument("--actor-subfolder", default=None,
+                   help="folder inside a Hub repo, e.g. nla/actor")
+    p.add_argument("--critic-subfolder", default=None,
+                   help="folder inside a Hub repo, e.g. nla/critic")
     p.add_argument("--critic-ckpt", type=str, default=DEFAULT_CRITIC_CKPT,
                    help=f"Path to critic SFT checkpoint (default: {DEFAULT_CRITIC_CKPT})")
     p.add_argument("--sidecar", type=str, default=DEFAULT_SIDECAR,
@@ -352,6 +368,8 @@ def main():
         critic_ckpt=args.critic_ckpt,
         sidecar_path=args.sidecar,
         device=device,
+        actor_subfolder=args.actor_subfolder,
+        critic_subfolder=args.critic_subfolder,
     )
 
     def _process(av: np.ndarray) -> dict:

@@ -186,6 +186,7 @@ def nla_predict_explanation_and_ar(
     mse_scale: float,
     max_new_tokens: int = 256,
     device: str = "cuda",
+    greedy: bool = False,
 ) -> str | None:
     """Run full NLA pipeline for one AV.  Returns (explanation_text, ar_vector)."""
     from nla.training.injection import inject_at_marked_positions
@@ -241,14 +242,23 @@ def nla_predict_explanation_and_ar(
         try:
             gen_out = actor.generate(
                 prompt_ids, max_new_tokens=max_new_tokens,
-                do_sample=True, temperature=1.0,
+                do_sample=not greedy,
+                temperature=None if greedy else 1.0,
+                top_p=None if greedy else 1.0,
+                top_k=None if greedy else 0,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
         finally:
             hook.remove()
 
-    full_text = tokenizer.decode(gen_out[0], skip_special_tokens=True)
+    # Decode ONLY the generated continuation. Decoding the full sequence lets
+    # extract_explanation match the literal "<explanation>" that appears in the
+    # PROMPT ("...enclosed within <explanation> tags."), so every "explanation"
+    # came back as ~60 tokens of instruction boilerplate glued to the real one --
+    # and that boilerplate is what the critic scored.
+    gen_ids = gen_out[0][prompt_ids.shape[1]:]
+    full_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
     explanation = extract_explanation(full_text)
     if explanation is None:
         return None, None
@@ -276,7 +286,8 @@ def nla_predict_explanation_and_ar(
 def main():
     p = argparse.ArgumentParser(description="NLA FVE evaluation")
     p.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
-    p.add_argument("--actor-ckpt", default=DEFAULT_ACTOR_CKPT)
+    p.add_argument("--actor-ckpt", default=DEFAULT_ACTOR_CKPT,
+                   help="Actor checkpoint (not needed with --critic-only)")
     p.add_argument("--critic-ckpt", default=DEFAULT_CRITIC_CKPT)
     p.add_argument("--sidecar", default=DEFAULT_SIDECAR)
     p.add_argument("--device", default="cuda")
@@ -286,7 +297,11 @@ def main():
     p.add_argument("--data", help="Parquet file with activation_vector column")
     p.add_argument("--n-samples", type=int, default=500, help="Samples to evaluate (from parquet)")
     p.add_argument("--text", help="Single text for quick eval")
+    p.add_argument("--critic-only", action="store_true",
+                   help="Skip actor: evaluate critic directly on AR-SFT prompts")
 
+    p.add_argument("--greedy", action="store_true",
+                   help="greedy decoding for the actor (default: sample at T=1.0)")
     p.add_argument("--jsonl", help="Save per-sample results to JSONL")
 
     args = p.parse_args()
@@ -295,9 +310,32 @@ def main():
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
 
-    actor, critic, tokenizer, tokens, d_model, mse_scale = load_models(
-        args.model_name, args.actor_ckpt, args.critic_ckpt, args.sidecar, device,
-    )
+    if args.critic_only:
+        # Only load critic + tokenizer, no actor needed
+        from nla.training.models import NLACriticModel
+        from nla.training.sidecar import read_sidecar
+        from transformers import AutoTokenizer
+        print(f"Loading critic {args.critic_ckpt}")
+        critic = NLACriticModel.from_pretrained(args.critic_ckpt, torch_dtype=torch.bfloat16)
+        critic = critic.to(device).eval()
+        tokenizer = AutoTokenizer.from_pretrained(args.critic_ckpt)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        sp = args.sidecar
+        if sp.endswith(".nla_meta.yaml"):
+            sp = sp[:-len(".nla_meta.yaml")]
+        sidecar = read_sidecar(sp)
+        d_model = sidecar["extraction"]["d_model"]
+        mse_scale_raw = sidecar.get("extraction", {}).get("mse_scale", math.sqrt(d_model))
+        if isinstance(mse_scale_raw, str):
+            mse_scale_raw = float(mse_scale_raw) if mse_scale_raw != "sqrt_d_model" else math.sqrt(d_model)
+        mse_scale = float(mse_scale_raw)
+        actor = None
+        tokens = sidecar["tokens"]
+    else:
+        actor, critic, tokenizer, tokens, d_model, mse_scale = load_models(
+            args.model_name, args.actor_ckpt, args.critic_ckpt, args.sidecar, device,
+        )
 
     # ── Load / collect gold vectors ──────────────────────────────────
     gold_vecs = []
@@ -325,7 +363,73 @@ def main():
     print(f"Baselines:  meannorm_MSE={mse_meannorm_baseline:.4f}  "
           f"rawvar_MSE={mse_rawvar_baseline:.4f}")
 
-    # ── Evaluate ─────────────────────────────────────────────────────
+    # ── Critic-only path (skip actor) ──────────────────────────────────
+    if args.critic_only:
+        critic.eval()
+        # Build prompts from explanation column or pre-built "prompt" column.
+        # "response" is checked FIRST: the AV-eval parquet has a "prompt" column
+        # too, but it holds the ACTOR chat messages (a list of dicts), not the
+        # critic template -- feeding that to the critic scores nonsense. Taking
+        # "response" lets critic-only run on the SAME rows as the e2e pass, which
+        # is the only apples-to-apples upper bound for the actor's text.
+        if "response" in df.columns:
+            from nla.training.schema import extract_explanation
+            prompts = []
+            for r in df["response"].astype(str):
+                expl = extract_explanation(r) or r
+                prompts.append(
+                    f"Summary of the following text: <text>{expl}</text> <summary>"
+                )
+        elif "prompt" in df.columns:
+            prompts = df["prompt"].tolist()
+        elif "api_explanation" in df.columns:
+            prompts = [
+                f"Summary of the following text: <text>{e}</text> <summary>"
+                for e in df["api_explanation"]
+            ]
+        else:
+            # Extract explanation from messages column (AV-SFT format)
+            from nla.training.schema import extract_explanation
+            prompts = []
+            for msg_list in df["messages"]:
+                text = msg_list[-1]["content"] if isinstance(msg_list, list) else str(msg_list)
+                expl = extract_explanation(text)
+                prompts.append(
+                    f"Summary of the following text: <text>{expl or text}</text> <summary>"
+                )
+
+        preds_cpu = []
+        batch_size = 16
+        for i in range(0, len(gold_t), batch_size):
+            batch_prompts = prompts[i:i+batch_size]
+            enc = tokenizer(batch_prompts, return_tensors="pt", padding=True,
+                           truncation=True, max_length=512)
+            with torch.no_grad():
+                c_out = critic(
+                    input_ids=enc["input_ids"].to(device),
+                    attention_mask=enc["attention_mask"].to(device),
+                )
+                seq_lens = enc["attention_mask"].sum(dim=1) - 1
+                p = c_out.values[torch.arange(len(seq_lens)), seq_lens]
+            preds_cpu.append(p.float().cpu())
+
+        pred_t = torch.cat(preds_cpu, dim=0)
+        pred_n = _normalize(pred_t, float(mse_scale))
+        gold_n = _normalize(gold_t, float(mse_scale))
+        mse_final = ((pred_n - gold_n) ** 2).mean().item()
+        fve_nrm = 1.0 - mse_final / mse_rawvar_baseline
+        fve_meannorm = 1.0 - mse_final / mse_meannorm_baseline
+        print(f"\n{'='*60}")
+        print(f"Critic-only evaluation ({len(gold_t)} samples, no actor)")
+        print(f"MSE:                {mse_final:.4f}")
+        print(f"baseline (rawvar):  {mse_rawvar_baseline:.4f}")
+        print(f"baseline (meannorm):{mse_meannorm_baseline:.4f}")
+        print(f"FVE_nrm:            {fve_nrm:.4f}  (>0 => beats predict-mean)")
+        print(f"FVE_nrm_meannorm:   {fve_meannorm:.4f}  (>0 => beats constant)")
+        print(f"{'='*60}")
+        return
+
+    # ── Full pipeline (actor → critic) ────────────────────────────────
     preds = []
     n_failed = 0
     results: list[dict] = []
@@ -334,6 +438,7 @@ def main():
         explanation, ar = nla_predict_explanation_and_ar(
             av, actor, critic, tokenizer, tokens, d_model,
             float(mse_scale), max_new_tokens=args.max_new_tokens, device=device,
+            greedy=args.greedy,
         )
         if explanation is None:
             n_failed += 1
@@ -342,9 +447,13 @@ def main():
         results.append({"idx": i, "explanation": explanation, "ar_vector": ar.tolist()})
 
         if (i + 1) % 50 == 0:
+            # Index gold by the ROW each pred came from. Using range(len(preds))
+            # silently misaligns pred[k] with gold[k] as soon as one sample fails
+            # extraction, which made the running FVE meaningless mid-run.
+            gold_now = gold_t[torch.tensor([r["idx"] for r in results])]
             mse_now = F.mse_loss(
                 _normalize(torch.stack(preds), float(mse_scale)),
-                _normalize(gold_t[list(range(len(preds)))], float(mse_scale)),
+                _normalize(gold_now, float(mse_scale)),
             ).item()
             fve = 1.0 - mse_now / mse_rawvar_baseline
             print(f"  {len(preds)}/{i+1}  MSE={mse_now:.4f}  "
@@ -365,13 +474,20 @@ def main():
     fve_nrm = 1.0 - mse_final / mse_rawvar_baseline
     fve_meannorm = 1.0 - mse_final / mse_meannorm_baseline
 
+    # Baseline over the SAME rows the MSE was computed on, so numerator and
+    # denominator can't disagree when extraction fails on a skewed subset.
+    sub_meannorm, sub_rawvar = compute_fve_baselines(gold_sub, float(mse_scale))
+
     print(f"\n{'='*60}")
-    print(f"Samples evaluated:  {len(preds)}  (failed extraction: {n_failed})")
+    print(f"Samples evaluated:  {len(preds)}  (failed extraction: {n_failed}"
+          f" = {n_failed / max(len(gold_vecs), 1) * 100:.1f}%)")
     print(f"MSE:                {mse_final:.4f}")
     print(f"baseline (rawvar):  {mse_rawvar_baseline:.4f}")
     print(f"baseline (meannorm):{mse_meannorm_baseline:.4f}")
     print(f"FVE_nrm:            {fve_nrm:.4f}  (>0 ⇒ better than predict-mean)")
     print(f"FVE_nrm_meannorm:   {fve_meannorm:.4f}  (>0 ⇒ better than constant)")
+    print(f"  [subset-matched baselines] meannorm={sub_meannorm:.4f} rawvar={sub_rawvar:.4f}"
+          f"  ->  FVE_nrm_meannorm={1.0 - mse_final / sub_meannorm:.4f}")
     print(f"reward equivalent:  {-mse_final:.4f}")
     print(f"{'='*60}")
 

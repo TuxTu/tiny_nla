@@ -14,6 +14,7 @@ CONDA_ENV=/home/x_tuhan/.conda/envs/tiny_nla
 export PATH="$CONDA_ENV/bin:$PATH"
 export LD_LIBRARY_PATH="$CONDA_ENV/lib:$LD_LIBRARY_PATH"
 export HF_HOME=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla/cache/huggingface
+export TORCHINDUCTOR_CACHE_DIR=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla/cache/torchinductor   # else torch defaults to /tmp/torchinductor_$USER
 mkdir -p "$HF_HOME"
 PROJ=/proj/assert-berzelius/users/x_tuhan/garage/tiny_nla
 
@@ -25,8 +26,9 @@ echo "Starting SGLang (GPU 0) ..."
 # Load proper build environment for Triton JIT compilation
 module load buildenv-gcccuda/12.4.1-gcc13.3.0
 export LD_LIBRARY_PATH=/software/sse/manual/GCC/13.3.0/lib64:$LD_LIBRARY_PATH
-export TRITON_CACHE_DIR=/tmp/triton_cache_$SLURM_JOB_ID
+export TRITON_CACHE_DIR=$PROJ/tmp/triton_cache_$SLURM_JOB_ID
 mkdir -p "$TRITON_CACHE_DIR"
+trap 'rm -rf "$TRITON_CACHE_DIR"' EXIT
 CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
     --model-path "$ACTOR_CKPT" --host 0.0.0.0 --port "$SGLANG_PORT" \
     --mem-fraction-static 0.70 --disable-radix-cache --trust-remote-code \
