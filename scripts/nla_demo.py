@@ -23,6 +23,17 @@ Needs one GPU with >=24 GB. Models load sequentially, not together.
 """
 import argparse, ast, builtins, difflib, keyword, os, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
+
+# HF_HOME must be set BEFORE huggingface_hub is imported -- it snapshots the
+# cache location at import time, so doing this inside main() is too late. When
+# the user has not chosen one, prefer this repo's cache: the weights are very
+# likely already there, and the default (~/.cache) would re-download ~33 GB
+# into a home directory that may not have the quota for it.
+if not os.environ.get("HF_HOME"):
+    _repo_cache = Path(__file__).resolve().parent.parent / "cache" / "huggingface"
+    if _repo_cache.is_dir():
+        os.environ["HF_HOME"] = str(_repo_cache)
+
 import numpy as np, torch, transformers, yaml
 from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -127,11 +138,23 @@ def parses(s):
         return False
 
 
+# Keywords of the curly-brace languages, so a lexical scan of non-Python source
+# does not report `int` or `return` as recovered identifiers.
+OTHER_KW = {"int", "float", "double", "char", "bool", "void", "long", "short",
+            "unsigned", "signed", "const", "static", "struct", "class", "public",
+            "private", "protected", "return", "if", "else", "for", "while", "do",
+            "switch", "case", "break", "continue", "new", "delete", "using",
+            "namespace", "template", "typename", "include", "std", "auto", "let",
+            "var", "function", "def", "fn", "pub", "impl", "final", "extends"}
+
+
 def idents(src):
+    """Identifiers in `src`, Python-aware when possible, lexical otherwise."""
     try:
         t = ast.parse(src)
     except SyntaxError:
-        return set()
+        return {w for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", src)
+                if w not in STOP and w not in OTHER_KW and not w.startswith("__")}
     return {v for n in ast.walk(t) for a in ("id", "arg", "name", "attr")
             if isinstance(v := getattr(n, a, None), str) and v not in STOP and not v.startswith("__")}
 
@@ -154,16 +177,22 @@ def main():
     raw = Path(a.file).read_text() if a.file else a.input
 
     code_mode = a.mode == "code"
-    if code_mode:
-        if not parses(raw):
-            sys.exit("--mode code needs valid Python; use --mode text for prose")
+    if code_mode and parses(raw):
         raw = ast.unparse(ast.parse(raw))          # canonicalise so formatting is not counted
+    elif code_mode:
+        # Not Python: encode and decode it anyway. Only the AST-based scoring
+        # needs a parse, so it degrades rather than refusing. The DECODER was
+        # trained on Python only, so treat any other language as exploratory.
+        print("note: input is not valid Python -- skipping canonicalisation and "
+              "AST scoring. The decoder is Python-trained; other languages are "
+              "out of distribution.")
     # Keep triton's JIT scratch and every tempfile default off /tmp.
     _sd = scratch_dir()
     if os.path.realpath(os.environ.get("TMPDIR", "/tmp")).startswith("/tmp"):
         os.environ["TMPDIR"] = _sd
     tempfile.tempdir = _sd
     os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_sd, "triton"))
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_sd, "inductor"))
     ensure_compiler()
     sub = CODE_SUB if code_mode else TEXT_SUB
     print(f"mode: {'CODE reconstruction' if code_mode else 'TEXT explanation'}   "
@@ -173,9 +202,14 @@ def main():
         sc = yaml.safe_load(open(hf_hub_download(REPO, f"{sub}/nla_meta.yaml")))
     except Exception as e:
         if "401" in str(e) or "Repository Not Found" in str(e):
-            sys.exit(f"cannot read {REPO}: it is private and this machine is not "
-                     f"authenticated.\n  run:  hf auth login\n"
-                     f"  then ask the repo owner to grant your HF account access.")
+            sys.exit(
+                f"cannot read {REPO} (401).\n"
+                f"  HF_HOME = {os.environ.get('HF_HOME', '<unset, using ~/.cache/huggingface>')}\n"
+                f"  token   = {'found' if os.path.exists(os.path.join(os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface')), 'token')) else 'NOT FOUND in that HF_HOME'}\n"
+                f"  The usual cause is HF_HOME pointing at a cache with no token,\n"
+                f"  not a missing account. Point it at the cache you logged into:\n"
+                f"      export HF_HOME=/path/to/cache/huggingface\n"
+                f"  Otherwise run `hf auth login`, and ask the repo owner for access.")
         raise
     meta = sc["tokens"]
     inj, L, R, ch = (meta["injection_token_id"], meta["injection_left_neighbor_id"],
@@ -243,12 +277,15 @@ def main():
     print(f"{bar}\n{'RECONSTRUCTED' if code_mode else 'EXPLANATION'}\n{bar}\n{pred}")
     if code_mode and pred:
         pu, cu = idents(pred), idents(raw)
-        sk = difflib.SequenceMatcher(None,
-                                     [type(n).__name__ for n in ast.walk(ast.parse(pred))] if parses(pred) else [],
-                                     [type(n).__name__ for n in ast.walk(ast.parse(raw))]).ratio()
+        def _shape(x):
+            return [type(n).__name__ for n in ast.walk(ast.parse(x))]
+        sk = (difflib.SequenceMatcher(None, _shape(pred), _shape(raw)).ratio()
+              if parses(pred) and parses(raw) else None)
         print(bar)
         print(f"exact match       : {pred.strip() == raw.strip()}")
-        print(f"AST-skeleton sim  : {sk:.3f}   (~0.52 for two arbitrary functions)")
+        print(f"AST-skeleton sim  : "
+              + (f"{sk:.3f}   (~0.52 for two arbitrary functions)" if sk is not None
+                 else "n/a   (needs both sides to be valid Python)"))
         print(f"identifier recall : {len(pu & cu)/max(len(cu),1):.2f}   shared: {sorted(pu & cu)[:8]}")
     if a.control:
         rng = np.random.default_rng(0)
