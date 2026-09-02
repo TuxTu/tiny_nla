@@ -57,6 +57,8 @@ def load_models(
     critic_ckpt: str = DEFAULT_CRITIC_CKPT,
     sidecar_path: str = DEFAULT_SIDECAR,
     device: str = "cuda",
+    actor_subfolder: str | None = None,
+    critic_subfolder: str | None = None,
 ):
     """Load actor and critic models from SFT checkpoints.
 
@@ -73,24 +75,28 @@ def load_models(
     from nla.training.sidecar import read_sidecar
 
     print(f"Loading actor from {actor_ckpt} ...")
+    _asub = {"subfolder": actor_subfolder} if actor_subfolder else {}
     actor = AutoModelForCausalLM.from_pretrained(
         actor_ckpt,
         torch_dtype=torch.bfloat16,
         device_map={"": device},
+        **_asub,
     )
     actor.eval()
 
     print(f"Loading critic from {critic_ckpt} ...")
+    _csub = {"subfolder": critic_subfolder} if critic_subfolder else {}
     critic = NLACriticModel.from_pretrained(
         critic_ckpt,
         torch_dtype=torch.bfloat16,
+        **_csub,
     )
     critic = critic.to(device)
     critic.eval()
 
     # Tokenizer from actor checkpoint (has chat template), fall back to model_name
     try:
-        tokenizer = AutoTokenizer.from_pretrained(actor_ckpt)
+        tokenizer = AutoTokenizer.from_pretrained(actor_ckpt, **_asub)
     except Exception:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token_id is None:
@@ -362,6 +368,8 @@ def main():
         critic_ckpt=args.critic_ckpt,
         sidecar_path=args.sidecar,
         device=device,
+        actor_subfolder=args.actor_subfolder,
+        critic_subfolder=args.critic_subfolder,
     )
 
     def _process(av: np.ndarray) -> dict:
