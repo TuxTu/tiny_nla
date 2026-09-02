@@ -21,7 +21,7 @@ pinned Hub paths, with no flag to select an older one.
 
 Needs one GPU with >=24 GB. Models load sequentially, not together.
 """
-import argparse, ast, builtins, difflib, keyword, re, sys
+import argparse, ast, builtins, difflib, keyword, os, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
 import numpy as np, torch, transformers, yaml
 from huggingface_hub import hf_hub_download
@@ -70,6 +70,36 @@ def normalize_activation(v, scale):
     return v / (v.float().norm(dim=-1, keepdim=True).clamp_min(1e-12) / scale).to(v.dtype)
 
 
+def ensure_compiler():
+    """Pick a C compiler that actually works, before torch needs one.
+
+    Triton JIT-compiles a CUDA helper on first GPU use and shells out to `cc`.
+    On NSC/Berzelius the gcc first on PATH is a wrapper that refuses to run
+    without a build-env module loaded; the refusal surfaces as a
+    CalledProcessError fifteen frames deep inside triton, naming a .c file the
+    user never wrote. Probe candidates once and export the first that links.
+    Costs one ~100ms compile, and is skipped entirely if CC is already set.
+    """
+    if os.environ.get("CC"):
+        return
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "probe.c")
+        with open(src, "w") as f:
+            f.write("int main(){return 0;}")
+        for cand in (shutil.which("cc"), shutil.which("gcc"), "/usr/bin/gcc"):
+            if not cand or not os.path.exists(cand):
+                continue
+            try:
+                r = subprocess.run([cand, "-shared", "-fPIC", "-o",
+                                    os.path.join(d, "probe.so"), src],
+                                   capture_output=True, timeout=60)
+            except Exception:
+                continue
+            if r.returncode == 0:
+                os.environ["CC"] = cand
+                return
+
+
 def parses(s):
     try:
         ast.parse(s); return True
@@ -108,6 +138,7 @@ def main():
         if not parses(raw):
             sys.exit("--mode code needs valid Python; use --mode text for prose")
         raw = ast.unparse(ast.parse(raw))          # canonicalise so formatting is not counted
+    ensure_compiler()
     sub = CODE_SUB if code_mode else TEXT_SUB
     print(f"mode: {'CODE reconstruction' if code_mode else 'TEXT explanation'}   "
           f"(checkpoint chosen automatically: {REPO}/{sub})")

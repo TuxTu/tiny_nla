@@ -509,6 +509,13 @@ the comparison that makes an output meaningful: it shows what the decoder's
 prior produces with no information at all. Use `--file mymodule.py` for input
 from a file.
 
+**On a cluster (NSC/Berzelius).** The demo probes for a working C compiler on
+startup and exports `CC` itself, because triton JIT-compiles a CUDA helper on
+first GPU use and the `gcc` first on PATH here is a wrapper that refuses
+without a build-env module. If you see a `CalledProcessError` naming a
+`cuda_utils.c` you never wrote, set `CC=/usr/bin/gcc` by hand. Nothing needs to
+go in `/tmp`.
+
 The sections below are the same two paths with all the plumbing exposed — use
 them if you want to point at a specific local checkpoint.
 
