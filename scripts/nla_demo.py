@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tiny_nla demo — one entry point, no model to choose.
 
-    pip install torch transformers huggingface_hub numpy pyyaml
+    pip install torch transformers accelerate huggingface_hub numpy pyyaml
     hf auth login
     hf download TuHan/tiny-nla nla_demo.py --local-dir .
 
@@ -23,7 +23,7 @@ Needs one GPU with >=24 GB. Models load sequentially, not together.
 """
 import argparse, ast, builtins, difflib, keyword, re, sys
 from pathlib import Path
-import numpy as np, torch, yaml
+import numpy as np, torch, transformers, yaml
 from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
